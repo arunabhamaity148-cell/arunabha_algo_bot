@@ -4,8 +4,12 @@ All settings in one place
 """
 
 import os
+import logging
 from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+# Initialize logger first
+logger = logging.getLogger(__name__)
 
 # ==================== Environment ====================
 
@@ -19,7 +23,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("Telegram credentials not set in environment")
+    logger.error("Telegram credentials not set in environment")
+    if ENV == "development":
+        raise ValueError("Telegram credentials not set in environment")
 
 # ==================== Exchange ====================
 
@@ -142,6 +148,8 @@ SIGNAL_GRADES = {
 
 MIN_SIGNAL_SCORE = 60  # Minimum score for any signal
 STRONG_SIGNAL_SCORE = 75  # Score for strong signal
+MIN_RR_RATIO = 1.5  # Minimum Risk-Reward Ratio
+ENTRY_CONFIRMATION_WAIT = True  # Wait for confirmation
 
 # ==================== Market Regime ====================
 
@@ -205,6 +213,16 @@ BB_STD = 2
 VOLUME_MA_PERIOD = 20
 VOLUME_MULT = 1.2
 
+# ==================== Confidence Thresholds ====================
+
+CONFIDENCE = {
+    "MIN_CONFIDENCE_ALLOW": 25,      # ২৫% কনফিডেন্স থাকলে ট্রেড করতে দেবে
+    "MIN_CONFIDENCE_DIRECTION": 30,   # ডিরেকশন মিসম্যাচ হলেও ট্রেড করবে
+    "MIN_CONFIDENCE_FORCE": 20,       # ফোর্স ট্রেডের জন্য
+    "ADX_HIGH_CONFIDENCE": 25,        # ADX ২৫+ হলে হাই কনফিডেন্স
+    "ADX_MED_CONFIDENCE": 20,         # ADX ২০-২৫ মিড কনফিডেন্স
+}
+
 # ==================== Sessions (IST) ====================
 
 SESSIONS = {
@@ -252,6 +270,16 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default-secret-change-this")
 DAILY_PROFIT_TARGET = 500  # ₹500 per day
 WEEKLY_PROFIT_TARGET = 2500  # ₹2500 per week
 MONTHLY_PROFIT_TARGET = 10000  # ₹10000 per month
+
+# ==================== Crash Mode ====================
+
+CRASH_MODE = {
+    "ACTIVE": False,  # True করলে ক্র্যাশ মোড চালু হবে
+    "MIN_CONFIDENCE": 15,
+    "RISK_MULTIPLIER": 0.5,
+    "MAX_POSITION_SIZE": 0.3,
+    "PREFER_SHORTS": True
+}
 
 # ==================== Logging ====================
 
@@ -305,6 +333,30 @@ class ConfigValidator:
         if MIN_SIGNAL_SCORE < 0 or MIN_SIGNAL_SCORE > 100:
             raise ValueError("MIN_SIGNAL_SCORE must be between 0 and 100")
 
+# ==================== Profit Calculation ====================
+
+def calculate_indian_profit(entry: float, exit: float, qty: float, side: str) -> Dict[str, float]:
+    """Calculate profit after TDS/GST for Indian exchanges"""
+    if side == "LONG":
+        gross_pnl = (exit - entry) * qty
+    else:
+        gross_pnl = (entry - exit) * qty
+    
+    if gross_pnl <= 0:
+        return {"net_pnl": gross_pnl, "tds": 0, "gst": 0, "gross": gross_pnl}
+    
+    tds = gross_pnl * (TDS_RATE / 100)
+    gst = gross_pnl * (GST_RATE / 100)  # Simplified, actual calculation differs
+    net_pnl = gross_pnl - tds - gst
+    
+    return {
+        "gross": round(gross_pnl, 2),
+        "tds": round(tds, 2),
+        "gst": round(gst, 2),
+        "net_pnl": round(net_pnl, 2)
+    }
+
 # Run validation on import
-logger = logging.getLogger(__name__)
+logger.info("Loading configuration...")
 ConfigValidator.validate_all()
+logger.info("Configuration loaded successfully")
