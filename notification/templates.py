@@ -5,7 +5,7 @@ Pre-defined message templates for common notifications
 
 from datetime import datetime
 import pytz
-import config  # 🔴 এই লাইনটা যোগ করুন
+import config  # 🔴 Important: config import must be here
 
 
 class MessageTemplates:
@@ -30,8 +30,11 @@ class MessageTemplates:
 • Risk/Trade: {config.RISK_PER_TRADE}%
 • Max Leverage: {config.MAX_LEVERAGE}x
 • Daily Target: ₹{config.DAILY_PROFIT_TARGET}
+• TDS Rate: {config.TDS_RATE}%
+• GST Rate: {config.GST_RATE}%
 
 🎯 <i>Manual signals only - Auto trade OFF</i>
+⚡ <i>Target: 3-5 high quality signals per day</i>
 """
     
     @staticmethod
