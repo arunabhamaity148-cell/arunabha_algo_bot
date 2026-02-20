@@ -23,7 +23,7 @@ numexpr==2.10.2
 
 # Database/ Cache
 redis==5.0.1
-aioredis==2.0.1
+
 
 # Timezone
 pytz==2024.1
