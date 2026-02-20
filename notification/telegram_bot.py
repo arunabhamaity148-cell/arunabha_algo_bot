@@ -8,7 +8,8 @@ import asyncio
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
-from telegram import Bot, ParseMode
+from telegram import Bot
+from telegram.constants import ParseMode  # 🔴 এটা ঠিক করুন
 from telegram.error import TelegramError
 
 import config
@@ -88,7 +89,7 @@ class TelegramNotifier:
     async def send_message(
         self,
         text: str,
-        parse_mode: str = ParseMode.HTML,
+        parse_mode: str = ParseMode.HTML,  # 🔴 এটা ঠিক করুন
         **kwargs
     ):
         """Queue a message to be sent"""
@@ -97,7 +98,7 @@ class TelegramNotifier:
     async def send_signal(self, signal: Dict, market_type: str):
         """Send trading signal"""
         text = self.formatter.format_signal(signal, market_type)
-        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
+        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)  # 🔴 এটা ঠিক করুন
         
         # Also send as separate alert if high confidence
         if signal.get("confidence", 0) >= 80:
@@ -106,7 +107,7 @@ class TelegramNotifier:
     async def send_startup(self):
         """Send startup message"""
         text = self.templates.startup_message()
-        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
+        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)  # 🔴 এটা ঠিক করুন
     
     async def send_shutdown(self):
         """Send shutdown message"""
@@ -116,12 +117,12 @@ class TelegramNotifier:
     async def send_daily_summary(self, stats: Dict):
         """Send daily trading summary"""
         text = self.formatter.format_daily_summary(stats)
-        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
+        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)  # 🔴 এটা ঠিক করুন
     
     async def send_weekly_summary(self, stats: Dict):
         """Send weekly trading summary"""
         text = self.formatter.format_weekly_summary(stats)
-        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
+        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)  # 🔴 এটা ঠিক করুন
     
     async def send_alert(self, message: str, level: str = "INFO"):
         """Send alert message"""
@@ -133,19 +134,19 @@ class TelegramNotifier:
         }.get(level, "📢")
         
         text = f"{emoji} <b>{level}</b>\n{message}"
-        await self.send_message(text, parse_mode=ParseMode.HTML)
+        await self.send_message(text, parse_mode=ParseMode.HTML)  # 🔴 এটা ঠিক করুন
     
     async def send_error(self, error: str, traceback: Optional[str] = None):
         """Send error notification"""
         text = f"🚨 <b>ERROR</b>\n{error}"
         if traceback:
             text += f"\n<pre>{traceback[:500]}</pre>"
-        await self.send_message(text, parse_mode=ParseMode.HTML)
+        await self.send_message(text, parse_mode=ParseMode.HTML)  # 🔴 এটা ঠিক করুন
     
     async def send_health_status(self, status: Dict):
         """Send health status"""
         text = self.formatter.format_health_status(status)
-        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
+        await self.send_message(text, parse_mode=ParseMode.MARKDOWN)  # 🔴 এটা ঠিক করুন
     
     async def send_test(self):
         """Send test message"""
