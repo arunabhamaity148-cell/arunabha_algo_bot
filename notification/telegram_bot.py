@@ -43,7 +43,7 @@ class TelegramNotifier:
     async def start(self):
         """Start the notification worker"""
         self._worker_task = asyncio.create_task(self._worker())
-        logger.info("Telegram notifier started")
+        logger.info("Telegram notifier worker started")
     
     async def stop(self):
         """Stop the notification worker"""
@@ -57,6 +57,7 @@ class TelegramNotifier:
     
     async def _worker(self):
         """Background worker to send messages"""
+        logger.info("Telegram worker thread started")
         while True:
             try:
                 # Get message from queue
@@ -78,9 +79,10 @@ class TelegramNotifier:
                 )
                 
                 self.last_message_time = datetime.now()
-                logger.debug(f"Telegram message sent: {text[:50]}...")
+                logger.info(f"✅ Telegram message sent: {text[:30]}...")
                 
             except asyncio.CancelledError:
+                logger.info("Telegram worker cancelled")
                 break
             except TelegramError as e:
                 logger.error(f"Telegram error: {e}")
@@ -95,7 +97,28 @@ class TelegramNotifier:
         parse_mode: str = ParseMode.HTML,
         **kwargs
     ):
-        """Queue a message to be sent"""
+        """Send message directly (bypass queue)"""
+        logger.info(f"Sending direct message: {text[:50]}...")
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                **kwargs
+            )
+            logger.info("✅ Direct message sent successfully")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Direct message failed: {e}")
+            return False
+    
+    async def send_message_queued(
+        self,
+        text: str,
+        parse_mode: str = ParseMode.HTML,
+        **kwargs
+    ):
+        """Queue a message to be sent by worker"""
         logger.info(f"Queueing message: {text[:50]}...")
         await self.message_queue.put((self.chat_id, text, parse_mode, kwargs))
     
@@ -106,7 +129,7 @@ class TelegramNotifier:
         
         # Also send as separate alert if high confidence
         if signal.get("confidence", 0) >= 80:
-            await self.send_alert(f"🔥 HIGH CONFIDENCE SIGNAL: {signal['symbol']} {signal['direction']}")
+            await self.send_message(f"🔥 HIGH CONFIDENCE SIGNAL: {signal['symbol']} {signal['direction']}")
     
     async def send_startup(self):
         """Send startup message"""
@@ -116,10 +139,16 @@ class TelegramNotifier:
             logger.info(f"Startup message prepared, length: {len(text)} chars")
             
             logger.info(f"Sending startup message to chat_id: {self.chat_id}")
-            await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
             
-            logger.info("✅ Startup message sent successfully to Telegram")
-            return True
+            # DIRECT SEND - bypass queue
+            result = await self.send_message(text, parse_mode=ParseMode.MARKDOWN)
+            
+            if result:
+                logger.info("✅ Startup message sent successfully to Telegram")
+            else:
+                logger.error("❌ Startup message failed")
+            
+            return result
         except Exception as e:
             logger.error(f"❌ Failed to send startup message: {e}")
             logger.exception(e)
@@ -168,17 +197,11 @@ class TelegramNotifier:
         """Send test message"""
         await self.send_message("🧪 Test message from ARUNABHA bot")
     
-    async def send_bulk(self, messages: List[str], interval: float = 1.0):
-        """Send multiple messages with interval"""
-        for msg in messages:
-            await self.send_message(msg)
-            await asyncio.sleep(interval)
-    
     def get_status(self) -> Dict:
         """Get notifier status"""
         return {
             "queue_size": self.message_queue.qsize(),
             "worker_running": self._worker_task is not None and not self._worker_task.done(),
             "last_message": self.last_message_time.isoformat(),
-            "chat_id": str(self.chat_id)[:3] + "..."  # Partial for privacy
+            "chat_id": str(self.chat_id)[:3] + "..."
         }
