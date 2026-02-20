@@ -1,0 +1,8 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "nixpacksConfig": {
+      "aptPackages": ["ta-lib", "build-essential", "python3-dev"]
+    }
+  }
+}
