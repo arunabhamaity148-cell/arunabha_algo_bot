@@ -4,7 +4,7 @@ Validates signals before sending
 """
 
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
 
 import config
