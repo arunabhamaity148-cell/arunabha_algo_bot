@@ -1,7 +1,6 @@
 # Web Framework
 fastapi==0.115.0
 uvicorn==0.30.0
-gunicorn==21.2.0
 
 # Telegram
 python-telegram-bot==20.7
