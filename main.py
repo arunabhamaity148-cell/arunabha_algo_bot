@@ -107,8 +107,14 @@ async def startup_event():
         health_checker = HealthChecker(engine, scheduler)
         metrics = MetricsCollector(engine)
         
-        # Send startup notification
-        await telegram.send_startup()
+        # Send startup notification with error handling
+        logger.info("📱 Attempting to send startup message to Telegram...")
+        try:
+            await telegram.send_startup()
+            logger.info("✅ Startup message sent successfully to Telegram")
+        except Exception as e:
+            logger.error(f"❌ Failed to send startup message: {e}")
+            logger.exception(e)
         
         # Start scheduler in background
         asyncio.create_task(scheduler.start())
@@ -117,6 +123,7 @@ async def startup_event():
         
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}")
+        logger.exception(e)
         raise
 
 @app.on_event("shutdown")
