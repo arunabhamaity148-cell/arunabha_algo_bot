@@ -10,7 +10,7 @@ from datetime import datetime
 import config
 from core.constants import MarketType, BTCRegime, SessionType
 from analysis.technical import TechnicalAnalyzer
-
+from analysis.market_regime import BTCRegimeResult
 logger = logging.getLogger(__name__)
 
 
