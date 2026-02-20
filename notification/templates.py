@@ -5,6 +5,7 @@ Pre-defined message templates for common notifications
 
 from datetime import datetime
 import pytz
+import config  # 🔴 এই লাইনটা যোগ করুন
 
 
 class MessageTemplates:
