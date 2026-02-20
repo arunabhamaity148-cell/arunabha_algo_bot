@@ -9,6 +9,7 @@ from datetime import datetime
 
 import config
 from core.constants import MarketType, BTCRegime, SignalGrade
+from analysis.market_regime import BTCRegimeResult
 from filters.tier1_filters import Tier1Filters
 from filters.tier2_filters import Tier2Filters
 from filters.tier3_filters import Tier3Filters
