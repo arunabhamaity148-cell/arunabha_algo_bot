@@ -16,7 +16,7 @@ from core.constants import (
 from data.websocket_manager import WebSocketManager
 from data.rest_client import RESTClient
 from data.cache_manager import CacheManager
-from analysis.market_regime import MarketRegimeDetector
+from analysis.market_regime import MarketRegimeDetector, BTCRegimeResult
 from analysis.technical import TechnicalAnalyzer
 from analysis.structure import StructureDetector
 from analysis.volume_profile import VolumeProfileAnalyzer
@@ -55,7 +55,7 @@ class ArunabhaEngine:
         
         # State
         self.market_type = MarketType.UNKNOWN
-        self.btc_regime = BTCRegime.UNKNOWN
+        self.btc_regime: Optional[BTCRegimeResult] = None
         self.last_signal_time: Dict[str, datetime] = {}
         self.daily_signals = 0
         self.consecutive_losses = 0
@@ -100,12 +100,13 @@ class ArunabhaEngine:
         logger.info("✅ Engine started successfully")
     
     async def _force_fetch_btc_data(self) -> bool:
-        """Force fetch BTC data with multiple retries"""
+        """Force fetch BTC data with multiple retries and detailed logging"""
         for attempt in range(10):  # ১০ বার চেষ্টা
             try:
-                logger.info(f"📡 BTC data fetch attempt {attempt+1}/10...")
+                logger.info(f"🔄 [ATTEMPT {attempt+1}/10] Fetching BTC data...")
                 
-                # Fetch all timeframes
+                # Try REST API first
+                logger.info("   📡 Fetching from REST API...")
                 btc_15m = await self.rest_client.fetch_ohlcv("BTC/USDT", "15m", 100)
                 btc_1h = await self.rest_client.fetch_ohlcv("BTC/USDT", "1h", 50)
                 btc_4h = await self.rest_client.fetch_ohlcv("BTC/USDT", "4h", 50)
@@ -121,22 +122,34 @@ class ArunabhaEngine:
                     self.btc_cache["1h"] = btc_1h if btc_1h else []
                     self.btc_cache["4h"] = btc_4h if btc_4h else []
                     self._btc_data_ready = True
-                    logger.info(f"✅ BTC data ready: {len(btc_15m)} candles")
+                    logger.info(f"✅✅ BTC DATA READY! {len(btc_15m)} candles")
                     
                     # Update regime immediately
                     await self._update_regime()
                     return True
                 else:
-                    logger.warning(f"⚠️ Insufficient BTC data: {len(btc_15m) if btc_15m else 0}/50 candles")
+                    logger.warning(f"   ⚠️ Only {len(btc_15m) if btc_15m else 0} candles - need 50")
+                
+                # Try WebSocket cache if REST failed
+                ws_candles = self.cache.get_ohlcv("BTC/USDT", "15m")
+                if ws_candles and len(ws_candles) > len(btc_15m or []):
+                    logger.info(f"   📡 Got {len(ws_candles)} candles from WebSocket cache")
+                    self.btc_cache["15m"] = ws_candles
                     
+                    if len(ws_candles) >= 50:
+                        self._btc_data_ready = True
+                        logger.info(f"✅✅ BTC DATA READY from WebSocket! {len(ws_candles)} candles")
+                        return True
+                
             except Exception as e:
-                logger.error(f"❌ BTC fetch attempt {attempt+1} failed: {e}")
+                logger.error(f"   ❌ Attempt {attempt+1} failed: {e}")
             
             # Wait before next attempt (increasing delay)
             wait_time = min(30, 5 * (attempt + 1))
-            logger.info(f"⏳ Waiting {wait_time}s before next attempt...")
+            logger.info(f"   ⏳ Waiting {wait_time}s before next attempt...")
             await asyncio.sleep(wait_time)
         
+        logger.error("❌❌ ALL BTC FETCH ATTEMPTS FAILED!")
         return False
     
     async def _background_btc_fetcher(self):
@@ -214,7 +227,7 @@ class ArunabhaEngine:
             self.market_type = self.regime_detector.detect_market_type(btc_15m, btc_1h)
             self.btc_regime = self.regime_detector.detect_btc_regime(btc_15m, btc_1h, btc_4h)
             
-            logger.info(f"📊 Market: {self.market_type.value} | BTC: {self.btc_regime.regime.value} | Conf: {self.btc_regime.confidence}%")
+            logger.info(f"📊 Market: {self.market_type.value} | BTC: {self.btc_regime.regime.value if self.btc_regime else 'unknown'} | Conf: {self.btc_regime.confidence if self.btc_regime else 0}%")
             
         except Exception as e:
             logger.error(f"❌ Regime update failed: {e}")
