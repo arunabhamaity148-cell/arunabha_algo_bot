@@ -32,6 +32,7 @@ class BinanceWSFeed:
         self._btc_received = False
         
     def _get_cache_key(self, symbol: str, tf: str) -> Tuple[str, str]:
+        """Get cache key for symbol and timeframe"""
         return (symbol, tf)
     
     def _init_cache(self, symbols: List[str], timeframes: List[str]):
@@ -43,16 +44,27 @@ class BinanceWSFeed:
         logger.info(f"✅ Cache initialized for {len(symbols)} symbols x {len(timeframes)} timeframes")
     
     def get_ohlcv(self, symbol: str, tf: str) -> List[List[float]]:
-        """Get cached OHLCV data"""
+        """
+        Get cached OHLCV data
+        Returns list of candles or empty list if not found
+        """
         key = self._get_cache_key(symbol, tf)
         if key in self._cache:
-            return list(self._cache[key])
+            data = list(self._cache[key])
+            if data:
+                logger.debug(f"📊 Cache hit: {symbol} {tf} - {len(data)} candles (latest: {data[-1][4]})")
+            else:
+                logger.debug(f"⚠️ Cache empty: {symbol} {tf}")
+            return data
+        
+        logger.debug(f"❌ Cache miss: {symbol} {tf} - key not found")
         return []
     
     def update_cache(self, symbol: str, tf: str, candle: List[float]):
         """Update cache with new candle"""
         key = self._get_cache_key(symbol, tf)
         if key not in self._cache:
+            logger.debug(f"🆕 Creating new cache for {symbol} {tf}")
             self._cache[key] = deque(maxlen=config.CACHE_SIZE)
         
         # Check if this candle exists (update) or is new
@@ -60,16 +72,16 @@ class BinanceWSFeed:
         if cached and int(candle[0]) == int(cached[-1][0]):
             # Update last candle
             self._cache[key][-1] = candle
-            logger.debug(f"🔄 Updated last candle for {symbol} {tf}")
+            logger.debug(f"🔄 Updated last candle for {symbol} {tf} @ {candle[4]:.2f}")
         else:
             # Add new candle
             self._cache[key].append(candle)
-            logger.debug(f"➕ New candle for {symbol} {tf} @ {candle[4]:.2f}")
+            logger.debug(f"➕ New candle for {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
             
             # Track BTC reception
             if symbol == "BTC/USDT" and tf == "15m":
                 self._btc_received = True
-                logger.info(f"✅ First BTC 15m candle received")
+                logger.info(f"✅ First BTC 15m candle received - total: {len(self._cache[key])}")
     
     async def seed_from_rest(self, rest_client):
         """Seed cache from REST API"""
@@ -84,8 +96,25 @@ class BinanceWSFeed:
             if btc_candles:
                 key = self._get_cache_key("BTC/USDT", "15m")
                 self._cache[key].extend(btc_candles)
-                logger.info(f"✅ Seeded BTC 15m: {len(btc_candles)} candles")
+                logger.info(f"✅ Seeded BTC 15m: {len(btc_candles)} candles (latest: {btc_candles[-1][4]})")
                 self._btc_received = True
+                
+                # Also seed higher timeframes for BTC
+                try:
+                    btc_1h = await rest_client.fetch_ohlcv("BTC/USDT", "1h", limit=50)
+                    if btc_1h:
+                        key_1h = self._get_cache_key("BTC/USDT", "1h")
+                        self._cache[key_1h].extend(btc_1h)
+                        logger.info(f"✅ Seeded BTC 1h: {len(btc_1h)} candles")
+                    
+                    btc_4h = await rest_client.fetch_ohlcv("BTC/USDT", "4h", limit=50)
+                    if btc_4h:
+                        key_4h = self._get_cache_key("BTC/USDT", "4h")
+                        self._cache[key_4h].extend(btc_4h)
+                        logger.info(f"✅ Seeded BTC 4h: {len(btc_4h)} candles")
+                except Exception as e:
+                    logger.warning(f"⚠️ BTC higher timeframe seed failed: {e}")
+                    
         except Exception as e:
             logger.error(f"❌ BTC seed failed: {e}")
         
@@ -103,7 +132,9 @@ class BinanceWSFeed:
                 except Exception as e:
                     logger.warning(f"⚠️ Seed failed {symbol} {tf}: {e}")
         
-        logger.info("🌱 Seeding complete")
+        # Log cache stats
+        total_candles = sum(len(q) for q in self._cache.values())
+        logger.info(f"🌱 Seeding complete - total candles in cache: {total_candles}")
     
     def _symbol_to_stream(self, symbol: str, tf: str) -> str:
         """Convert symbol to Binance stream name"""
@@ -128,18 +159,27 @@ class BinanceWSFeed:
             if not k:
                 return None
             
+            symbol = data.get("s", "").replace("USDT", "/USDT")
+            timeframe = k.get("i")
+            is_closed = k.get("x", False)
+            
+            candle = [
+                k.get("t"),  # timestamp
+                float(k.get("o", 0)),  # open
+                float(k.get("h", 0)),  # high
+                float(k.get("l", 0)),  # low
+                float(k.get("c", 0)),  # close
+                float(k.get("v", 0)),  # volume
+            ]
+            
+            if is_closed:
+                logger.debug(f"🔔 Candle closed: {symbol} {timeframe} @ {candle[4]:.2f}")
+            
             return {
-                "symbol": data.get("s", "").replace("USDT", "/USDT"),
-                "timeframe": k.get("i"),
-                "candle": [
-                    k.get("t"),  # timestamp
-                    float(k.get("o", 0)),  # open
-                    float(k.get("h", 0)),  # high
-                    float(k.get("l", 0)),  # low
-                    float(k.get("c", 0)),  # close
-                    float(k.get("v", 0)),  # volume
-                ],
-                "is_closed": k.get("x", False)
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "candle": candle,
+                "is_closed": is_closed
             }
         except Exception as e:
             logger.error(f"❌ Kline parse error: {e}")
@@ -267,9 +307,17 @@ class WebSocketManager:
     
     def get_status(self) -> Dict:
         """Get WebSocket status"""
+        # Count candles per symbol
+        cache_stats = {}
+        for (symbol, tf), queue in self.feed._cache.items():
+            if symbol not in cache_stats:
+                cache_stats[symbol] = {}
+            cache_stats[symbol][tf] = len(queue)
+        
         return {
             "connected": self._connected,
             "retry_count": self._retry_count,
             "btc_received": self.feed._btc_received,
-            "cache_size": sum(len(q) for q in self.feed._cache.values())
+            "total_candles": sum(len(q) for q in self.feed._cache.values()),
+            "cache_stats": cache_stats
         }
