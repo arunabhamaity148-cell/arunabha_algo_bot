@@ -121,7 +121,7 @@ class ArunabhaEngine:
                     self.btc_cache["1h"] = btc_1h if btc_1h else []
                     self.btc_cache["4h"] = btc_4h if btc_4h else []
                     
-                    # 🔴 FORCE UPDATE WEBSOCKET CACHE
+                    # Force update WebSocket cache
                     logger.info("   🔄 Force updating WebSocket cache...")
                     self.cache.set_ohlcv("BTC/USDT", "15m", btc_15m)
                     if btc_1h:
@@ -196,6 +196,15 @@ class ArunabhaEngine:
             if btc_candles:
                 self.cache.set_ohlcv("BTC/USDT", "15m", btc_candles)
                 logger.info(f"✅ Seeded BTC: {len(btc_candles)} candles")
+                
+            btc_1h = await self.rest_client.fetch_ohlcv("BTC/USDT", "1h", 50)
+            if btc_1h:
+                self.cache.set_ohlcv("BTC/USDT", "1h", btc_1h)
+                
+            btc_4h = await self.rest_client.fetch_ohlcv("BTC/USDT", "4h", 50)
+            if btc_4h:
+                self.cache.set_ohlcv("BTC/USDT", "4h", btc_4h)
+                
         except Exception as e:
             logger.warning(f"⚠️ BTC seed failed: {e}")
         
@@ -222,9 +231,9 @@ class ArunabhaEngine:
                 return
             
             # Get BTC data from CACHE
-            btc_15m = self.cache.get_ohlcv("BTC/USDT", "15m")
-            btc_1h = self.cache.get_ohlcv("BTC/USDT", "1h")
-            btc_4h = self.cache.get_ohlcv("BTC/USDT", "4h")
+            btc_15m = self.cache.get_ohlcv("BTC/USDT", Timeframes.M15.value)
+            btc_1h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H1.value)
+            btc_4h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H4.value)
             
             if not btc_15m or len(btc_15m) < 30:
                 logger.warning(f"⚠️ Insufficient BTC data for regime: {len(btc_15m) if btc_15m else 0}/30")
@@ -353,21 +362,26 @@ class ArunabhaEngine:
         """Get all required data from CACHE for signal generation"""
         
         try:
-            # Get OHLCV data from CACHE (not engine cache)
-            ohlcv_5m = self.cache.get_ohlcv(symbol, Timeframes.M5)
-            ohlcv_15m = self.cache.get_ohlcv(symbol, Timeframes.M15)
-            ohlcv_1h = self.cache.get_ohlcv(symbol, Timeframes.H1)
-            ohlcv_4h = self.cache.get_ohlcv(symbol, Timeframes.H4)
+            # Get OHLCV data from CACHE - use .value to get string
+            ohlcv_5m = self.cache.get_ohlcv(symbol, Timeframes.M5.value)
+            ohlcv_15m = self.cache.get_ohlcv(symbol, Timeframes.M15.value)
+            ohlcv_1h = self.cache.get_ohlcv(symbol, Timeframes.H1.value)
+            ohlcv_4h = self.cache.get_ohlcv(symbol, Timeframes.H4.value)
             
-            # Get BTC data from CACHE (not engine cache)
-            btc_15m = self.cache.get_ohlcv("BTC/USDT", Timeframes.M15)
-            btc_1h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H1)
-            btc_4h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H4)
+            # Get BTC data from CACHE - use .value to get string
+            btc_15m = self.cache.get_ohlcv("BTC/USDT", Timeframes.M15.value)
+            btc_1h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H1.value)
+            btc_4h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H4.value)
             
             # Log what we got
             logger.debug(f"📊 Data for {symbol}:")
+            logger.debug(f"   {symbol} 5m: {len(ohlcv_5m) if ohlcv_5m else 0} candles")
             logger.debug(f"   {symbol} 15m: {len(ohlcv_15m) if ohlcv_15m else 0} candles")
+            logger.debug(f"   {symbol} 1h: {len(ohlcv_1h) if ohlcv_1h else 0} candles")
+            logger.debug(f"   {symbol} 4h: {len(ohlcv_4h) if ohlcv_4h else 0} candles")
             logger.debug(f"   BTC 15m: {len(btc_15m) if btc_15m else 0} candles")
+            logger.debug(f"   BTC 1h: {len(btc_1h) if btc_1h else 0} candles")
+            logger.debug(f"   BTC 4h: {len(btc_4h) if btc_4h else 0} candles")
             
             # Validate data
             if not ohlcv_15m:
@@ -404,6 +418,8 @@ class ArunabhaEngine:
             
         except Exception as e:
             logger.error(f"❌ Error getting data for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     async def _process_signal(self, signal: Dict):
@@ -444,7 +460,7 @@ class ArunabhaEngine:
     def get_status(self) -> Dict:
         """Get engine status"""
         # Get BTC from cache for status
-        btc_candles = len(self.cache.get_ohlcv("BTC/USDT", "15m"))
+        btc_candles = len(self.cache.get_ohlcv("BTC/USDT", Timeframes.M15.value))
         
         return {
             "market_type": self.market_type.value,
