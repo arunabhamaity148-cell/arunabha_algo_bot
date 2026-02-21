@@ -45,7 +45,7 @@ class BinanceWSFeed:
             
         data = list(self._cache[key])
         if data:
-            logger.debug(f"✅ Cache HIT: {symbol} {tf} - {len(data)} candles")
+            logger.debug(f"✅ Cache HIT: {symbol} {tf} - {len(data)} candles (latest: {data[-1][4]})")
             return data
         return []
     
@@ -60,16 +60,16 @@ class BinanceWSFeed:
         # চেক করো এই ক্যান্ডেল আগে আছে কিনা
         if self._cache[key] and int(candle[0]) == int(self._cache[key][-1][0]):
             self._cache[key][-1] = candle
-            logger.debug(f"🔄 Updated {symbol} {tf} @ {candle[4]:.2f}")
+            logger.info(f"🔄 UPDATED: {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
         else:
             self._cache[key].append(candle)
-            logger.info(f"➕ ADDED {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
+            logger.info(f"➕ ADDED: {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
             
             if symbol == "BTC/USDT" and tf == "15m":
                 self._btc_ready = True
                 logger.info(f"✅ BTC 15m ready - {len(self._cache[key])} candles")
     
-    def seed_from_rest(self, rest_client):
+    async def seed_from_rest(self, rest_client):
         """REST থেকে ডেটা নিয়ে ক্যাশ সিড করো"""
         logger.info("🌱 Seeding cache from REST...")
         
@@ -77,15 +77,10 @@ class BinanceWSFeed:
         timeframes = ["5m", "15m", "1h", "4h"]
         
         # সব সিম্বলের জন্য ডেটা আনো
-        import asyncio
-        loop = asyncio.get_event_loop()
-        
         for symbol in symbols:
             for tf in timeframes:
                 try:
-                    candles = loop.run_until_complete(
-                        rest_client.fetch_ohlcv(symbol, tf, limit=100)
-                    )
+                    candles = await rest_client.fetch_ohlcv(symbol, tf, limit=100)
                     if candles:
                         key = self._get_key(symbol, tf)
                         self._cache[key] = deque(candles, maxlen=100)
@@ -105,6 +100,7 @@ class WebSocketManager:
         self._stop = asyncio.Event()
         self._connected = False
         self._retry = 0
+        self._message_count = 0
         
     async def start(self):
         """স্টার্ট করো"""
@@ -139,10 +135,10 @@ class WebSocketManager:
                 await asyncio.sleep(wait)
     
     async def _connect(self):
-        """কানেক্ট করো এবং লিসেন করো"""
+        """কানেক্ট করো এবং লিসেন করো - সব পেয়ার সহ"""
         streams = [
             "btcusdt@kline_15m",
-            "ethusdt@kline_15m", 
+            "ethusdt@kline_15m",
             "dogeusdt@kline_15m",
             "solusdt@kline_15m",
             "renderusdt@kline_15m",
@@ -151,8 +147,11 @@ class WebSocketManager:
             "btcusdt@kline_4h"
         ]
         
-        url = BINANCE_WS_URL + "/".join(streams)
-        logger.info(f"🔌 Connecting to: {url}")
+        stream_names = "/".join(streams)
+        url = BINANCE_WS_URL + stream_names
+        
+        logger.info(f"🔌 Connecting to Binance WebSocket...")
+        logger.info(f"📡 Streams: {len(streams)}")
         
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
@@ -160,7 +159,7 @@ class WebSocketManager:
                 heartbeat=PING_INTERVAL,
                 receive_timeout=30
             ) as ws:
-                logger.info("✅ WebSocket CONNECTED!")
+                logger.info("✅✅✅ WebSocket CONNECTED SUCCESSFULLY!")
                 self._connected = True
                 self._retry = 0
                 
@@ -170,6 +169,12 @@ class WebSocketManager:
                     
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         await self._process(msg.data)
+                        self._message_count += 1
+                        
+                        # প্রতি ১০০ মেসেজে একবার log
+                        if self._message_count % 100 == 0:
+                            logger.info(f"📊 Total messages received: {self._message_count}")
+                    
                     elif msg.type == aiohttp.WSMsgType.CLOSED:
                         logger.warning("⚠️ WebSocket closed")
                         break
@@ -178,9 +183,10 @@ class WebSocketManager:
                         break
                 
                 self._connected = False
+                logger.warning("⚠️ WebSocket disconnected")
     
     async def _process(self, raw: str):
-        """মেসেজ প্রসেস করো"""
+        """মেসেজ প্রসেস করো - ফোর্স প্রিন্ট সহ"""
         try:
             data = json.loads(raw)
             stream = data.get("stream", "")
@@ -192,7 +198,8 @@ class WebSocketManager:
                 return
             
             # সিম্বল ঠিক করো
-            symbol = payload.get("s", "").replace("USDT", "/USDT")
+            raw_symbol = payload.get("s", "")
+            symbol = raw_symbol.replace("USDT", "/USDT")
             tf = k.get("i")
             is_closed = k.get("x", False)
             
@@ -205,9 +212,9 @@ class WebSocketManager:
                 float(k.get("v", 0)),           # volume
             ]
             
-            # ফোর্স প্রিন্ট - দেখো ডেটা আসছে কিনা
-            print(f"🔥 WEBSOCKET: {symbol} {tf} @ {candle[4]} closed={is_closed}")
-            logger.info(f"🔥 WEBSOCKET: {symbol} {tf} @ {candle[4]} closed={is_closed}")
+            # 🔥🔥🔥 ফোর্স প্রিন্ট - কনসোলে দেখাবেই
+            print(f"🔥🔥🔥 WEBSOCKET LIVE: {symbol} {tf} @ {candle[4]:.2f} closed={is_closed}")
+            logger.info(f"🔥🔥🔥 WEBSOCKET: {symbol} {tf} @ {candle[4]:.2f} closed={is_closed}")
             
             # ক্যাশ আপডেট করো
             self.feed.update_cache(symbol, tf, candle)
@@ -216,10 +223,15 @@ class WebSocketManager:
             if is_closed and self.feed.on_candle_close:
                 candles = self.feed.get_ohlcv(symbol, tf)
                 if candles:
+                    logger.info(f"🔔 Triggering signal for {symbol} {tf} with {len(candles)} candles")
                     await self.feed.on_candle_close(symbol, tf, candles)
                     
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON decode error: {e}")
         except Exception as e:
             logger.error(f"❌ Process error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def is_connected(self) -> bool:
         """কানেক্টেড কিনা চেক করো"""
@@ -227,10 +239,16 @@ class WebSocketManager:
     
     def get_status(self) -> Dict:
         """স্ট্যাটাস দাও"""
+        # ক্যাশ স্ট্যাটাস বের করো
+        cache_stats = {}
+        for key, queue in self.feed._cache.items():
+            cache_stats[key] = len(queue)
+        
         return {
             "connected": self._connected,
             "retry": self._retry,
-            "message_count": self.feed._message_count,
+            "message_count": self._message_count,
             "btc_ready": self.feed._btc_ready,
-            "cache_size": sum(len(q) for q in self.feed._cache.values())
+            "cache_size": sum(len(q) for q in self.feed._cache.values()),
+            "cache_stats": cache_stats
         }
