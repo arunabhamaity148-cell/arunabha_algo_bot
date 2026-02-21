@@ -6,7 +6,7 @@ Manages timing and session-based operations
 import asyncio
 import logging
 from typing import Dict, List, Optional, Callable, Any
-from datetime import datetime, time, timedelta  # 🔴 'timedelta' যোগ করা হলো
+from datetime import datetime, time, timedelta
 import pytz
 
 import config
@@ -44,10 +44,13 @@ class TradingScheduler:
     async def start(self):
         """Start the scheduler"""
         self.running = True
-        logger.info("Scheduler started")
+        logger.info("🚀 Scheduler started")
         
         # Start main loop
         self.tasks.append(asyncio.create_task(self._main_loop()))
+        
+        # Start force scanner (every 15 minutes)
+        self.tasks.append(asyncio.create_task(self._force_scan()))
         
         # Start scheduled tasks
         for task_config in self.scheduled_tasks:
@@ -76,7 +79,7 @@ class TradingScheduler:
                 
                 # Log every hour
                 if now.minute == 0:
-                    logger.info(f"Scheduler: {now.strftime('%H:%M')} | Session: {current_session}")
+                    logger.info(f"⏰ Scheduler: {now.strftime('%H:%M')} | Session: {current_session}")
                 
                 await asyncio.sleep(60)
                 
@@ -84,6 +87,45 @@ class TradingScheduler:
                 break
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _force_scan(self):
+        """Force scan all pairs every 15 minutes"""
+        while self.running:
+            try:
+                # Wait for next 15-minute mark
+                now = datetime.now()
+                minutes = now.minute
+                next_scan = 15 - (minutes % 15)
+                
+                logger.info(f"⏰ Next scan in {next_scan} minutes (at {(minutes + next_scan) % 60:02d}:00)")
+                await asyncio.sleep(next_scan * 60)
+                
+                # Force scan all pairs
+                logger.info("🔍 ===== FORCE SCANNING ALL PAIRS =====")
+                
+                if not self.engine._btc_data_ready:
+                    logger.warning("⚠️ BTC data not ready - cannot scan")
+                    continue
+                
+                for symbol in config.TRADING_PAIRS:
+                    try:
+                        # Get latest candles
+                        candles = self.engine.cache.get_ohlcv(symbol, "15m")
+                        if candles and len(candles) > 20:
+                            logger.info(f"🔍 Checking {symbol} - {len(candles)} candles available")
+                            await self.engine._generate_signal(symbol, candles)
+                        else:
+                            logger.warning(f"⚠️ Insufficient data for {symbol}: {len(candles) if candles else 0} candles")
+                    except Exception as e:
+                        logger.error(f"❌ Error scanning {symbol}: {e}")
+                
+                logger.info("✅ ===== SCAN COMPLETE =====")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ Force scan error: {e}")
                 await asyncio.sleep(60)
     
     async def _run_scheduled(self, task_config: Dict):
@@ -98,14 +140,14 @@ class TradingScheduler:
                 
                 # If target time passed, schedule for tomorrow
                 if now > target:
-                    target = target + timedelta(days=1)  # 🔴 'timedelta' ব্যবহার করা হলো
+                    target = target + timedelta(days=1)
                 
                 # Wait until target time
                 wait_seconds = (target - now).total_seconds()
                 await asyncio.sleep(wait_seconds)
                 
                 # Execute callback
-                logger.info(f"Executing scheduled task: {task_config['name']}")
+                logger.info(f"📅 Executing scheduled task: {task_config['name']}")
                 
                 if "session" in task_config:
                     await task_config["callback"](task_config["session"])
@@ -118,7 +160,7 @@ class TradingScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Scheduled task {task_config['name']} error: {e}")
+                logger.error(f"❌ Scheduled task {task_config['name']} error: {e}")
                 await asyncio.sleep(60)
     
     def _get_current_session(self) -> Optional[SessionType]:
@@ -134,17 +176,17 @@ class TradingScheduler:
     
     async def _daily_reset(self):
         """Reset daily counters"""
-        logger.info("Daily reset triggered")
+        logger.info("📅 Daily reset triggered")
         self.engine.reset_daily()
     
     async def _update_regime(self):
         """Update market regime"""
-        logger.info("Regime update triggered")
+        logger.info("📊 Regime update triggered")
         await self.engine._update_regime()
     
     async def _session_start(self, session: SessionType):
         """Handle session start"""
-        logger.info(f"Session started: {session.value}")
+        logger.info(f"🕐 Session started: {session.value}")
         
         # Notify via Telegram
         if self.engine.telegram:
