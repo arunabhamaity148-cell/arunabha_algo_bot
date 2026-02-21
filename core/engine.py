@@ -60,40 +60,78 @@ class ArunabhaEngine:
         self.daily_signals = 0
         self.consecutive_losses = 0
         
-        logger.info("Engine initialized")
+        # BTC Data cache
+        self.btc_cache = {"15m": [], "1h": [], "4h": []}
+        self._btc_data_ready = False
+        self._last_btc_check = None
+        
+        logger.info("🚀 Engine initialized")
     
     async def start(self):
         """Start the engine"""
-        logger.info("Starting engine...")
+        logger.info("🟢 Starting engine...")
         
         # Connect to exchange
+        logger.info("🔌 Connecting to exchange...")
         await self.rest_client.connect()
         
         # Seed cache with historical data
+        logger.info("🌱 Seeding cache with historical data...")
         await self._seed_cache()
         
+        # Force BTC data fetch
+        logger.info("🔄 Force fetching BTC data...")
+        btc_fetched = await self._force_fetch_btc_data()
+        if btc_fetched:
+            logger.info("✅ BTC data loaded successfully")
+        else:
+            logger.error("❌ BTC data failed to load - signals may be delayed")
+        
         # Start WebSocket
+        logger.info("🔌 Starting WebSocket connection...")
         await self.ws_manager.start()
         
         # Initial regime detection
         await self._update_regime()
         
-        logger.info("Engine started")
+        logger.info("✅ Engine started successfully")
+    
+    async def _force_fetch_btc_data(self) -> bool:
+        """Force fetch BTC data with retries"""
+        for attempt in range(5):
+            try:
+                logger.info(f"📡 BTC data fetch attempt {attempt+1}/5...")
+                
+                self.btc_cache["15m"] = await self.rest_client.fetch_ohlcv("BTC/USDT", "15m", 100)
+                self.btc_cache["1h"] = await self.rest_client.fetch_ohlcv("BTC/USDT", "1h", 50)
+                self.btc_cache["4h"] = await self.rest_client.fetch_ohlcv("BTC/USDT", "4h", 50)
+                
+                if len(self.btc_cache["15m"]) >= 50:
+                    self._btc_data_ready = True
+                    logger.info(f"✅ BTC 15m: {len(self.btc_cache['15m'])} candles")
+                    logger.info(f"✅ BTC 1h: {len(self.btc_cache['1h'])} candles")
+                    logger.info(f"✅ BTC 4h: {len(self.btc_cache['4h'])} candles")
+                    return True
+                else:
+                    logger.warning(f"⚠️ Insufficient BTC data: {len(self.btc_cache['15m'])}/50 candles")
+                    
+            except Exception as e:
+                logger.error(f"❌ BTC fetch attempt {attempt+1} failed: {e}")
+            
+            await asyncio.sleep(10)
+        
+        return False
     
     async def stop(self):
         """Stop the engine"""
-        logger.info("Stopping engine...")
-        
+        logger.info("🔴 Stopping engine...")
         await self.ws_manager.stop()
         await self.rest_client.close()
-        
-        logger.info("Engine stopped")
+        logger.info("✅ Engine stopped")
     
     async def _seed_cache(self):
         """Pre-fill cache with historical data"""
-        logger.info("Seeding cache with historical data...")
-        
-        for symbol in config.TRADING_PAIRS:
+        for symbol in config.TRADING_PAIRS + ["BTC/USDT"]:
             for tf in config.TIMEFRAMES:
                 try:
                     candles = await self.rest_client.fetch_ohlcv(
@@ -101,32 +139,38 @@ class ArunabhaEngine:
                     )
                     if candles:
                         self.cache.set_ohlcv(symbol, tf, candles)
-                        logger.debug(f"Seeded {symbol} {tf}: {len(candles)} candles")
+                        logger.debug(f"✅ Seeded {symbol} {tf}: {len(candles)} candles")
+                    else:
+                        logger.warning(f"⚠️ No data for {symbol} {tf}")
                 except Exception as e:
-                    logger.warning(f"Failed to seed {symbol} {tf}: {e}")
+                    logger.warning(f"❌ Failed to seed {symbol} {tf}: {e}")
         
-        logger.info("Cache seeding complete")
+        logger.info("🌱 Cache seeding complete")
     
     async def _update_regime(self):
         """Update market regime and BTC regime"""
         try:
+            if not self._btc_data_ready:
+                logger.warning("⚠️ BTC data not ready - skipping regime update")
+                return
+            
             # Get BTC data
-            btc_15m = self.cache.get_ohlcv("BTC/USDT", Timeframes.M15)
-            btc_1h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H1)
-            btc_4h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H4)
+            btc_15m = self.btc_cache["15m"]
+            btc_1h = self.btc_cache["1h"]
+            btc_4h = self.btc_cache["4h"]
             
             if not btc_15m or len(btc_15m) < 30:
-                logger.warning("Insufficient BTC data for regime detection")
+                logger.warning(f"⚠️ Insufficient BTC data: {len(btc_15m) if btc_15m else 0}/30")
                 return
             
             # Detect regimes
             self.market_type = self.regime_detector.detect_market_type(btc_15m, btc_1h)
             self.btc_regime = self.regime_detector.detect_btc_regime(btc_15m, btc_1h, btc_4h)
             
-            logger.info(f"Market: {self.market_type.value} | BTC: {self.btc_regime.value}")
+            logger.info(f"📊 Market: {self.market_type.value} | BTC: {self.btc_regime.regime.value} | Conf: {self.btc_regime.confidence}%")
             
         except Exception as e:
-            logger.error(f"Regime update failed: {e}")
+            logger.error(f"❌ Regime update failed: {e}")
     
     async def _on_candle_close(self, symbol: str, tf: str, candles: List[List[float]]):
         """
@@ -137,77 +181,105 @@ class ArunabhaEngine:
             return
         
         try:
+            logger.info(f"🔔 Candle closed: {symbol} @ {candles[-1][4]:.2f}")
+            
             # Update cache
             self.cache.set_ohlcv(symbol, tf, candles)
             
-            # Check if we can trade
-            if not await self._can_process_signal(symbol):
+            # Update BTC data if this is BTC
+            if symbol == "BTC/USDT":
+                self.btc_cache[tf] = candles
+                if tf == "15m" and len(candles) >= 50:
+                    self._btc_data_ready = True
+                    logger.debug("✅ BTC 15m data updated")
+            
+            # Check if we can process signal
+            can_process, reason = await self._can_process_signal(symbol)
+            if not can_process:
+                logger.info(f"⏸️ {symbol}: {reason}")
                 return
             
-            # Update regime every hour
-            if datetime.now().minute == 0:
-                await self._update_regime()
-            
             # Generate signal
-            signal = await self._generate_signal(symbol, candles)
-            
-            if signal:
-                await self._process_signal(signal)
+            await self._generate_signal(symbol, candles)
                 
         except Exception as e:
-            logger.error(f"Error processing candle close for {symbol}: {e}")
+            logger.error(f"❌ Error processing candle close for {symbol}: {e}")
     
-    async def _can_process_signal(self, symbol: str) -> bool:
-        """Check if we can process a signal"""
+    async def _can_process_signal(self, symbol: str) -> Tuple[bool, str]:
+        """Check if we can process a signal with detailed reason"""
+        
+        # Check BTC data
+        if not self._btc_data_ready:
+            return False, "BTC data not ready"
         
         # Check daily limit
         if self.daily_signals >= self._get_daily_limit():
-            logger.debug(f"Daily signal limit reached: {self.daily_signals}")
-            return False
+            return False, f"Daily signal limit reached ({self.daily_signals}/{self._get_daily_limit()})"
         
         # Check cooldown
         if symbol in self.last_signal_time:
             elapsed = (datetime.now() - self.last_signal_time[symbol]).total_seconds() / 60
             if elapsed < config.COOLDOWN_MINUTES:
-                logger.debug(f"Cooldown for {symbol}: {elapsed:.1f}/{config.COOLDOWN_MINUTES}")
-                return False
+                return False, f"Cooldown ({elapsed:.1f}/{config.COOLDOWN_MINUTES} min)"
         
         # Check risk manager
-        if not self.risk_manager.can_trade(symbol):
-            logger.debug(f"Risk manager blocked {symbol}")
-            return False
+        can_trade, risk_reason = self.risk_manager.can_trade(symbol, self.market_type)
+        if not can_trade:
+            return False, f"Risk manager: {risk_reason}"
         
-        return True
+        return True, "OK"
     
     def _get_daily_limit(self) -> int:
         """Get daily signal limit based on market type"""
         limits = config.MAX_SIGNALS_PER_DAY
-        
-        if self.consecutive_losses >= 2:
-            return limits["after_2_losses"]
-        
         return limits.get(self.market_type.value, limits["default"])
     
-    async def _generate_signal(self, symbol: str, candles_15m: List[List[float]]) -> Optional[Dict]:
-        """Generate signal for a symbol"""
+    async def _generate_signal(self, symbol: str, candles_15m: List[List[float]]):
+        """Generate signal for a symbol with detailed logging"""
+        
+        logger.info(f"🔍 Checking {symbol} for signal...")
         
         # Get all required data
         data = await self._get_all_data(symbol)
         if not data:
-            return None
+            logger.info(f"❌ {symbol}: No data available")
+            return
         
         # Apply filters
+        logger.info(f"🔍 Applying filters for {symbol}...")
         filter_result = await self.filter_orchestrator.evaluate(
             symbol=symbol,
-            direction=None,  # Will be determined
+            direction=None,
             market_type=self.market_type,
             btc_regime=self.btc_regime,
             data=data
         )
         
+        # Log filter results in detail
         if not filter_result["passed"]:
-            logger.debug(f"Filters failed for {symbol}: {filter_result['reason']}")
-            return None
+            logger.info(f"❌ {symbol}: Filters failed - {filter_result['reason']}")
+            
+            # Log Tier1 failures
+            if "tier1" in filter_result:
+                failed_tier1 = [k for k, v in filter_result["tier1"].items() if not v["passed"]]
+                if failed_tier1:
+                    logger.info(f"   Tier1 failed: {', '.join(failed_tier1)}")
+                    for f in failed_tier1:
+                        logger.info(f"      - {f}: {filter_result['tier1'][f]['message']}")
+            
+            # Log Tier2 score
+            if "tier2" in filter_result:
+                logger.info(f"   Tier2 score: {filter_result.get('score', 0)}%")
+                
+            # Log Tier3 bonus
+            if "tier3" in filter_result:
+                total_bonus = sum(v.get("bonus", 0) for v in filter_result["tier3"].values())
+                if total_bonus > 0:
+                    logger.info(f"   Bonus points: +{total_bonus}")
+            
+            return
+        
+        logger.info(f"✅ {symbol}: Filters passed with score {filter_result['score']}%")
         
         # Generate signal
         signal = await self.signal_generator.generate(
@@ -218,7 +290,10 @@ class ArunabhaEngine:
             btc_regime=self.btc_regime
         )
         
-        return signal
+        if signal:
+            await self._process_signal(signal)
+        else:
+            logger.info(f"❌ {symbol}: Signal generation failed")
     
     async def _get_all_data(self, symbol: str) -> Optional[Dict]:
         """Get all required data for signal generation"""
@@ -230,14 +305,18 @@ class ArunabhaEngine:
             ohlcv_1h = self.cache.get_ohlcv(symbol, Timeframes.H1)
             ohlcv_4h = self.cache.get_ohlcv(symbol, Timeframes.H4)
             
-            # Get BTC data
-            btc_15m = self.cache.get_ohlcv("BTC/USDT", Timeframes.M15)
-            btc_1h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H1)
-            btc_4h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H4)
+            # Get BTC data from cache
+            btc_15m = self.btc_cache.get("15m", [])
+            btc_1h = self.btc_cache.get("1h", [])
+            btc_4h = self.btc_cache.get("4h", [])
             
             # Validate data
-            if not all([ohlcv_15m, btc_15m]):
-                logger.warning(f"Insufficient data for {symbol}")
+            if not ohlcv_15m:
+                logger.warning(f"⚠️ No 15m data for {symbol}")
+                return None
+            
+            if not btc_15m or len(btc_15m) < 30:
+                logger.warning(f"⚠️ Insufficient BTC data: {len(btc_15m) if btc_15m else 0}/30")
                 return None
             
             # Get other data
@@ -265,7 +344,7 @@ class ArunabhaEngine:
             }
             
         except Exception as e:
-            logger.error(f"Error getting data for {symbol}: {e}")
+            logger.error(f"❌ Error getting data for {symbol}: {e}")
             return None
     
     async def _process_signal(self, signal: Dict):
@@ -281,7 +360,7 @@ class ArunabhaEngine:
         )
         
         if position.get("blocked"):
-            logger.warning(f"Position sizing blocked: {position.get('reason')}")
+            logger.warning(f"⏸️ Position sizing blocked: {position.get('reason')}")
             return
         
         signal["position"] = position
@@ -294,44 +373,24 @@ class ArunabhaEngine:
         # Send notification
         await self.telegram.send_signal(signal, self.market_type)
         
-        # Update metrics
-        await self.metrics.record_signal(signal)
-        
-        logger.info(
-            f"✅ Signal generated: {symbol} {signal['direction']} "
-            f"@ {signal['entry']:.2f} | Score: {signal['score']} | "
-            f"Grade: {signal['grade']}"
-        )
-    
-    async def on_trade_result(self, symbol: str, pnl_pct: float):
-        """Called when a trade is closed"""
-        
-        if pnl_pct < 0:
-            self.consecutive_losses += 1
-            logger.warning(f"Loss #{self.consecutive_losses}: {symbol} @ {pnl_pct:.2f}%")
-        else:
-            self.consecutive_losses = 0
-            logger.info(f"Win: {symbol} @ {pnl_pct:.2f}%")
-        
-        # Update risk manager
-        self.risk_manager.update_daily_pnl(pnl_pct)
+        logger.info(f"✅ SIGNAL GENERATED: {symbol} {signal['direction']} @ {signal['entry']:.2f} | Score: {signal['score']} | Grade: {signal['grade']}")
     
     def reset_daily(self):
         """Reset daily counters"""
         self.daily_signals = 0
         self.consecutive_losses = 0
         self.risk_manager.reset_daily()
-        logger.info("Daily counters reset")
+        logger.info("📅 Daily counters reset")
     
     def get_status(self) -> Dict:
         """Get engine status"""
         return {
             "market_type": self.market_type.value,
-            "btc_regime": self.btc_regime.value,
+            "btc_regime": self.btc_regime.regime.value if self.btc_regime else "unknown",
+            "btc_confidence": self.btc_regime.confidence if self.btc_regime else 0,
+            "btc_data_ready": self._btc_data_ready,
             "daily_signals": self.daily_signals,
             "daily_limit": self._get_daily_limit(),
-            "consecutive_losses": self.consecutive_losses,
-            "active_trades": self.risk_manager.active_trades_count,
-            "daily_pnl": self.risk_manager.daily_pnl,
-            "day_locked": self.risk_manager.day_locked
+            "active_trades": len(self.risk_manager.active_trades),
+            "day_locked": self.risk_manager.daily_lock.is_locked if hasattr(self.risk_manager, 'daily_lock') else False
         }
