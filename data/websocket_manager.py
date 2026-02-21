@@ -42,23 +42,33 @@ class BinanceWSFeed:
                 key = self._get_cache_key(symbol, tf)
                 self._cache[key] = deque(maxlen=config.CACHE_SIZE)
         logger.info(f"✅ Cache initialized for {len(symbols)} symbols x {len(timeframes)} timeframes")
+        logger.debug(f"   Cache keys: {list(self._cache.keys())}")
     
     def get_ohlcv(self, symbol: str, tf: str) -> List[List[float]]:
         """
-        Get cached OHLCV data
+        Get cached OHLCV data with verification
         Returns list of candles or empty list if not found
         """
         key = self._get_cache_key(symbol, tf)
+        
+        # Log the request
+        logger.debug(f"🔍 Cache request: {symbol} {tf}")
+        
         if key in self._cache:
             data = list(self._cache[key])
             if data:
-                logger.debug(f"📊 Cache hit: {symbol} {tf} - {len(data)} candles (latest: {data[-1][4]})")
+                logger.debug(f"✅ Cache HIT: {symbol} {tf} - {len(data)} candles (latest: {data[-1][4]})")
+                return data
             else:
-                logger.debug(f"⚠️ Cache empty: {symbol} {tf}")
-            return data
-        
-        logger.debug(f"❌ Cache miss: {symbol} {tf} - key not found")
-        return []
+                logger.debug(f"⚠️ Cache EMPTY: {symbol} {tf} - key exists but no data")
+                return []
+        else:
+            logger.debug(f"❌ Cache MISS: {symbol} {tf} - key not found")
+            
+            # List available keys for debugging (first 5)
+            available = [f"{k[0]} {k[1]}" for k in list(self._cache.keys())[:5]]
+            logger.debug(f"   Available keys (first 5): {available}")
+            return []
     
     def update_cache(self, symbol: str, tf: str, candle: List[float]):
         """Update cache with new candle"""
@@ -81,44 +91,70 @@ class BinanceWSFeed:
             # Track BTC reception
             if symbol == "BTC/USDT" and tf == "15m":
                 self._btc_received = True
-                logger.info(f"✅ First BTC 15m candle received - total: {len(self._cache[key])}")
+                logger.info(f"✅ BTC 15m candle received - total: {len(self._cache[key])}")
     
     async def seed_from_rest(self, rest_client):
-        """Seed cache from REST API"""
+        """Seed cache from REST API and ensure it's accessible"""
         logger.info("🌱 Seeding WebSocket cache from REST...")
         
         symbols = config.TRADING_PAIRS + ["BTC/USDT"]
         self._init_cache(symbols, config.TIMEFRAMES)
         
-        # Seed BTC first
+        # Seed BTC first - with explicit logging and verification
         try:
-            btc_candles = await rest_client.fetch_ohlcv("BTC/USDT", "15m", limit=config.CACHE_SIZE)
-            if btc_candles:
-                key = self._get_cache_key("BTC/USDT", "15m")
-                self._cache[key].extend(btc_candles)
-                logger.info(f"✅ Seeded BTC 15m: {len(btc_candles)} candles (latest: {btc_candles[-1][4]})")
-                self._btc_received = True
+            logger.info("📡 Fetching BTC data for cache...")
+            
+            # Fetch all BTC timeframes
+            btc_15m = await rest_client.fetch_ohlcv("BTC/USDT", "15m", limit=config.CACHE_SIZE)
+            if btc_15m and len(btc_15m) > 0:
+                key_15m = self._get_cache_key("BTC/USDT", "15m")
+                self._cache[key_15m].clear()  # Clear existing
+                self._cache[key_15m].extend(btc_15m)
+                logger.info(f"✅ Cached BTC 15m: {len(btc_15m)} candles (latest: {btc_15m[-1][4]})")
                 
-                # Also seed higher timeframes for BTC
-                try:
-                    btc_1h = await rest_client.fetch_ohlcv("BTC/USDT", "1h", limit=50)
-                    if btc_1h:
-                        key_1h = self._get_cache_key("BTC/USDT", "1h")
-                        self._cache[key_1h].extend(btc_1h)
-                        logger.info(f"✅ Seeded BTC 1h: {len(btc_1h)} candles")
-                    
-                    btc_4h = await rest_client.fetch_ohlcv("BTC/USDT", "4h", limit=50)
-                    if btc_4h:
-                        key_4h = self._get_cache_key("BTC/USDT", "4h")
-                        self._cache[key_4h].extend(btc_4h)
-                        logger.info(f"✅ Seeded BTC 4h: {len(btc_4h)} candles")
-                except Exception as e:
-                    logger.warning(f"⚠️ BTC higher timeframe seed failed: {e}")
+                # Verify cache immediately
+                verify = self.get_ohlcv("BTC/USDT", "15m")
+                if verify:
+                    logger.info(f"🔍 VERIFICATION PASSED - Cache now has {len(verify)} candles for BTC 15m")
+                else:
+                    logger.error(f"❌ VERIFICATION FAILED - BTC 15m not in cache!")
+                
+                self._btc_received = True
+            else:
+                logger.warning("⚠️ No BTC 15m data received")
+            
+            # Seed BTC 1h
+            btc_1h = await rest_client.fetch_ohlcv("BTC/USDT", "1h", limit=50)
+            if btc_1h:
+                key_1h = self._get_cache_key("BTC/USDT", "1h")
+                self._cache[key_1h].clear()
+                self._cache[key_1h].extend(btc_1h)
+                logger.info(f"✅ Cached BTC 1h: {len(btc_1h)} candles")
+                
+                # Verify
+                verify = self.get_ohlcv("BTC/USDT", "1h")
+                if verify:
+                    logger.info(f"🔍 BTC 1h verified: {len(verify)} candles")
+            
+            # Seed BTC 4h
+            btc_4h = await rest_client.fetch_ohlcv("BTC/USDT", "4h", limit=50)
+            if btc_4h:
+                key_4h = self._get_cache_key("BTC/USDT", "4h")
+                self._cache[key_4h].clear()
+                self._cache[key_4h].extend(btc_4h)
+                logger.info(f"✅ Cached BTC 4h: {len(btc_4h)} candles")
+                
+                # Verify
+                verify = self.get_ohlcv("BTC/USDT", "4h")
+                if verify:
+                    logger.info(f"🔍 BTC 4h verified: {len(verify)} candles")
                     
         except Exception as e:
-            logger.error(f"❌ BTC seed failed: {e}")
+            logger.error(f"❌ BTC cache seed failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         
-        # Then other symbols
+        # Seed other symbols
         for symbol in symbols:
             if symbol == "BTC/USDT":
                 continue
@@ -127,14 +163,35 @@ class BinanceWSFeed:
                     candles = await rest_client.fetch_ohlcv(symbol, tf, limit=config.CACHE_SIZE)
                     if candles:
                         key = self._get_cache_key(symbol, tf)
+                        self._cache[key].clear()
                         self._cache[key].extend(candles)
-                        logger.debug(f"✅ Seeded {symbol} {tf}: {len(candles)} candles")
+                        logger.info(f"✅ Cached {symbol} {tf}: {len(candles)} candles")
+                        
+                        # Verify
+                        verify = self.get_ohlcv(symbol, tf)
+                        if verify:
+                            logger.debug(f"🔍 Verified {symbol} {tf}: {len(verify)} candles")
                 except Exception as e:
                     logger.warning(f"⚠️ Seed failed {symbol} {tf}: {e}")
         
-        # Log cache stats
-        total_candles = sum(len(q) for q in self._cache.values())
-        logger.info(f"🌱 Seeding complete - total candles in cache: {total_candles}")
+        # Final cache stats
+        total = sum(len(q) for q in self._cache.values())
+        logger.info(f"🌱 Seeding complete - TOTAL CANDLES IN CACHE: {total}")
+        
+        # Print detailed cache summary
+        logger.info("📊 CACHE SUMMARY:")
+        cache_summary = {}
+        for (sym, tf), queue in self._cache.items():
+            if len(queue) > 0:
+                cache_summary[f"{sym} {tf}"] = len(queue)
+                logger.info(f"   ✅ {sym} {tf}: {len(queue)} candles")
+        
+        # Double-check BTC specifically
+        btc_check = self.get_ohlcv("BTC/USDT", "15m")
+        if btc_check:
+            logger.info(f"🔍 FINAL BTC VERIFICATION: {len(btc_check)} candles available")
+        else:
+            logger.error("❌ FINAL BTC VERIFICATION FAILED - BTC not in cache!")
     
     def _symbol_to_stream(self, symbol: str, tf: str) -> str:
         """Convert symbol to Binance stream name"""
@@ -292,7 +349,10 @@ class WebSocketManager:
             if is_closed and self.feed.on_candle_close:
                 try:
                     candles = self.feed.get_ohlcv(symbol, tf)
-                    await self.feed.on_candle_close(symbol, tf, candles)
+                    if candles:
+                        await self.feed.on_candle_close(symbol, tf, candles)
+                    else:
+                        logger.warning(f"⚠️ No candles for {symbol} {tf} in callback")
                 except Exception as e:
                     logger.error(f"❌ Callback error: {e}")
             
@@ -309,15 +369,21 @@ class WebSocketManager:
         """Get WebSocket status"""
         # Count candles per symbol
         cache_stats = {}
+        total = 0
         for (symbol, tf), queue in self.feed._cache.items():
             if symbol not in cache_stats:
                 cache_stats[symbol] = {}
             cache_stats[symbol][tf] = len(queue)
+            total += len(queue)
+        
+        # Specifically check BTC
+        btc_candles = len(self.feed._cache.get(("BTC/USDT", "15m"), []))
         
         return {
             "connected": self._connected,
             "retry_count": self._retry_count,
             "btc_received": self.feed._btc_received,
-            "total_candles": sum(len(q) for q in self.feed._cache.values()),
+            "btc_15m_candles": btc_candles,
+            "total_candles": total,
             "cache_stats": cache_stats
         }
