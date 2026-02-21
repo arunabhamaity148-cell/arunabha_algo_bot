@@ -22,6 +22,7 @@ class RESTClient:
     def __init__(self):
         self.exchange: Optional[ccxt.Exchange] = None
         self._rate_limiter = asyncio.Semaphore(10)  # Max 10 concurrent requests
+        self._connection_attempts = 0
         
     async def connect(self):
         """Connect to exchange"""
@@ -39,16 +40,18 @@ class RESTClient:
             # Load markets
             await self.exchange.load_markets()
             logger.info("✅ REST client connected to Binance")
+            self._connection_attempts = 0
             
         except Exception as e:
-            logger.error(f"REST client connection failed: {e}")
+            self._connection_attempts += 1
+            logger.error(f"❌ REST client connection failed (attempt {self._connection_attempts}): {e}")
             raise
     
     async def close(self):
         """Close exchange connection"""
         if self.exchange:
             await self.exchange.close()
-            logger.info("REST client closed")
+            logger.info("🔌 REST client closed")
     
     async def fetch_ohlcv(
         self,
@@ -62,7 +65,8 @@ class RESTClient:
         Returns: List of [timestamp, open, high, low, close, volume]
         """
         if not self.exchange:
-            raise ConnectionError("Exchange not connected")
+            logger.warning(f"⚠️ Exchange not connected, attempting reconnect...")
+            await self.connect()
         
         async with self._rate_limiter:
             try:
@@ -74,19 +78,24 @@ class RESTClient:
                     symbol, timeframe, since=since, limit=limit, params=params
                 )
                 
+                if ohlcv:
+                    logger.debug(f"📊 Fetched {len(ohlcv)} candles for {symbol} {timeframe}")
+                else:
+                    logger.warning(f"⚠️ No data for {symbol} {timeframe}")
+                
                 return ohlcv
                 
             except ccxt.RateLimitExceeded as e:
-                logger.warning(f"Rate limit exceeded for {symbol}: {e}")
+                logger.warning(f"⚠️ Rate limit exceeded for {symbol}: {e}")
                 await asyncio.sleep(10)
                 return []
                 
             except ccxt.NetworkError as e:
-                logger.warning(f"Network error for {symbol}: {e}")
+                logger.warning(f"⚠️ Network error for {symbol}: {e}")
                 return []
                 
             except Exception as e:
-                logger.error(f"OHLCV fetch error {symbol}: {e}")
+                logger.error(f"❌ OHLCV fetch error {symbol}: {e}")
                 return []
     
     async def fetch_orderbook(
@@ -110,7 +119,7 @@ class RESTClient:
                 }
                 
             except Exception as e:
-                logger.warning(f"Orderbook fetch error {symbol}: {e}")
+                logger.warning(f"⚠️ Orderbook fetch error {symbol}: {e}")
                 return {"bids": [], "asks": []}
     
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
@@ -132,7 +141,7 @@ class RESTClient:
                 }
                 
             except Exception as e:
-                logger.warning(f"Ticker fetch error {symbol}: {e}")
+                logger.warning(f"⚠️ Ticker fetch error {symbol}: {e}")
                 return {}
     
     async def fetch_funding_rate(self, symbol: str) -> float:
@@ -146,7 +155,7 @@ class RESTClient:
                 return funding.get("fundingRate", 0.0)
                 
             except Exception as e:
-                logger.debug(f"Funding rate fetch error {symbol}: {e}")
+                logger.debug(f"⚠️ Funding rate fetch error {symbol}: {e}")
                 return 0.0
     
     async def fetch_open_interest(self, symbol: str) -> float:
@@ -160,7 +169,7 @@ class RESTClient:
                 return oi.get("openInterestAmount", 0.0)
                 
             except Exception as e:
-                logger.debug(f"Open interest fetch error {symbol}: {e}")
+                logger.debug(f"⚠️ Open interest fetch error {symbol}: {e}")
                 return 0.0
     
     async def fetch_fear_greed_index(self) -> int:
@@ -175,7 +184,7 @@ class RESTClient:
                         return int(data["data"][0]["value"])
                         
         except Exception as e:
-            logger.warning(f"Fear & Greed fetch error: {e}")
+            logger.warning(f"⚠️ Fear & Greed fetch error: {e}")
         
         return 50  # Default neutral
     
@@ -194,7 +203,7 @@ class RESTClient:
         output = {}
         for symbol, result in zip(symbols, results):
             if isinstance(result, Exception):
-                logger.warning(f"Failed to fetch {symbol}: {result}")
+                logger.warning(f"⚠️ Failed to fetch {symbol}: {result}")
                 output[symbol] = []
             else:
                 output[symbol] = result
@@ -237,5 +246,5 @@ class RESTClient:
             # Set next since to last candle timestamp + 1ms
             current_since = candles[-1][0] + 1
         
-        logger.info(f"Fetched {len(all_candles)} candles for {symbol} {timeframe}")
+        logger.info(f"📊 Fetched {len(all_candles)} candles for {symbol} {timeframe}")
         return all_candles
