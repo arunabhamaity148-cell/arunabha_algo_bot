@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
 
 import config
-from core.constants import MarketType, BTCRegime, SignalGrade
+from core.constants import MarketType, SignalGrade
 from analysis.market_regime import BTCRegimeResult
 from filters.tier1_filters import Tier1Filters
 from filters.tier2_filters import Tier2Filters
@@ -45,10 +45,12 @@ class FilterOrchestrator:
         data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Evaluate all filters
+        Evaluate all filters with detailed logging
         """
         self.stats["total_evaluations"] += 1
         self.stats["last_evaluation"] = datetime.now().isoformat()
+        
+        logger.info(f"🔍 ===== FILTER EVALUATION START: {symbol} =====")
         
         result = {
             "passed": False,
@@ -61,40 +63,68 @@ class FilterOrchestrator:
             "timestamp": datetime.now().isoformat()
         }
         
-        # Tier 1 - Mandatory filters
+        # ========== TIER 1 - MANDATORY FILTERS ==========
+        logger.info("📊 TIER 1: Mandatory filters")
         tier1_passed, tier1_results = self.tier1.evaluate_all(
             symbol, direction, market_type, btc_regime, data
         )
         result["tier1"] = tier1_results
         
+        # Log each Tier1 result
+        for filter_name, filter_result in tier1_results.items():
+            status = "✅" if filter_result["passed"] else "❌"
+            logger.info(f"   {status} {filter_name}: {filter_result['message']}")
+        
         if not tier1_passed:
-            result["reason"] = "Tier1 filters failed"
+            failed = [k for k, v in tier1_results.items() if not v["passed"]]
+            result["reason"] = f"Tier1 filters failed: {', '.join(failed)}"
             result["grade"] = "D"
-            logger.debug(f"Tier1 failed for {symbol}")
+            logger.info(f"❌ TIER 1 FAILED: {', '.join(failed)}")
+            logger.info(f"🔍 ===== FILTER EVALUATION END: {symbol} - NO SIGNAL =====\n")
             return result
         
+        logger.info("✅ TIER 1 PASSED - All mandatory filters OK")
         self.stats["tier1_passed"] += 1
         
-        # Tier 2 - Quality filters
+        # ========== TIER 2 - QUALITY FILTERS ==========
+        logger.info("📊 TIER 2: Quality filters (weighted scoring)")
         tier2_passed, tier2_score, tier2_results = self.tier2.evaluate_all(
             symbol, direction, market_type, data
         )
         result["tier2"] = tier2_results
         result["score"] = tier2_score
         
+        # Log top Tier2 filters
+        passed_tier2 = [(k, v) for k, v in tier2_results.items() if v["passed"]]
+        if passed_tier2:
+            logger.info(f"   ✅ Passed: {len(passed_tier2)}/{len(tier2_results)} filters")
+            for name, res in passed_tier2[:3]:  # Show top 3
+                logger.info(f"      ✓ {name}: {res['message']} (+{res['score']} pts)")
+        
         if not tier2_passed:
-            result["reason"] = f"Tier2 score too low: {tier2_score}%"
+            result["reason"] = f"Tier2 score too low: {tier2_score}% (need {config.MIN_TIER2_SCORE}%)"
             result["grade"] = "C"
-            logger.debug(f"Tier2 failed for {symbol}: {tier2_score}%")
+            logger.info(f"❌ TIER 2 FAILED: Score {tier2_score}% < {config.MIN_TIER2_SCORE}%")
+            logger.info(f"🔍 ===== FILTER EVALUATION END: {symbol} - NO SIGNAL =====\n")
             return result
         
+        logger.info(f"✅ TIER 2 PASSED: Score {tier2_score}%")
         self.stats["tier2_passed"] += 1
         
-        # Tier 3 - Bonus filters
+        # ========== TIER 3 - BONUS FILTERS ==========
+        logger.info("📊 TIER 3: Bonus filters")
         tier3_bonus, tier3_results = self.tier3.evaluate_all(
             symbol, direction, data
         )
         result["tier3"] = tier3_results
+        
+        if tier3_bonus > 0:
+            logger.info(f"   ✅ Bonus points: +{tier3_bonus}")
+            for name, res in tier3_results.items():
+                if res["bonus"] > 0:
+                    logger.info(f"      ✓ {name}: +{res['bonus']} ({res['message']})")
+        else:
+            logger.info("   ⏸️ No bonus filters triggered")
         
         # Calculate final score with bonus
         final_score = min(100, tier2_score + tier3_bonus)
@@ -108,16 +138,18 @@ class FilterOrchestrator:
         if grade.can_trade:
             result["passed"] = True
             result["reason"] = f"All filters passed. Score: {final_score}% ({grade.value})"
+            logger.info(f"✅✅ SIGNAL APPROVED: {symbol} - Grade {grade.value}, Score {final_score}%")
             self.stats["signals_generated"] += 1
         else:
-            result["reason"] = f"Final grade too low: {grade.value}"
+            result["reason"] = f"Final grade too low: {grade.value} (need B or better)"
+            logger.info(f"❌ FINAL REJECTED: Grade {grade.value} < B")
+        
+        logger.info(f"🔍 ===== FILTER EVALUATION END: {symbol} - {'APPROVED' if result['passed'] else 'REJECTED'} =====\n")
         
         return result
     
     def get_summary(self, result: Dict[str, Any]) -> str:
-        """
-        Get human-readable filter summary
-        """
+        """Get human-readable filter summary"""
         if not result["passed"]:
             return f"❌ {result['reason']}"
         
@@ -149,9 +181,7 @@ class FilterOrchestrator:
         return "\n".join(lines)
     
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Get filter statistics
-        """
+        """Get filter statistics"""
         return {
             **self.stats,
             "tier1_success_rate": (self.stats["tier1_passed"] / self.stats["total_evaluations"] * 100) if self.stats["total_evaluations"] > 0 else 0,
