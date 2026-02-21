@@ -50,12 +50,16 @@ class CacheManager:
                 "hits": 0,
                 "misses": 0
             }
+            logger.debug(f"🆕 Created new cache for {key}")
     
     # ==================== OHLCV Cache ====================
     
     def set_ohlcv(self, symbol: str, tf: str, candles: List[List[float]]):
-        """Set OHLCV data in cache"""
+        """Set OHLCV data in cache with verification"""
         key = self._get_key(symbol, tf)
+        
+        logger.info(f"📦 Cache SET: {symbol} {tf} - {len(candles)} candles")
+        
         self._init_cache(key)
         
         # Clear and extend
@@ -64,14 +68,22 @@ class CacheManager:
             self._caches[key].append(candle)
         
         self._last_update[key] = datetime.now()
-        logger.debug(f"Cached {len(candles)} candles for {key}")
+        
+        # Verify immediately
+        verify = list(self._caches[key])
+        if verify:
+            logger.info(f"✅ Cache SET verified: {len(verify)} candles for {symbol} {tf} (latest: {verify[-1][4]})")
+        else:
+            logger.error(f"❌ Cache SET verification failed for {symbol} {tf}")
     
     def get_ohlcv(self, symbol: str, tf: str, limit: Optional[int] = None) -> List[List[float]]:
-        """Get OHLCV data from cache"""
+        """Get OHLCV data from cache with verification"""
         key = self._get_key(symbol, tf)
         
+        logger.debug(f"🔍 Cache get: {symbol} {tf}")
+        
         if key not in self._caches:
-            self._metadata.get(key, {})["misses"] = self._metadata.get(key, {}).get("misses", 0) + 1
+            logger.debug(f"❌ Cache MISS: {key} not found")
             return []
         
         # Update hit count
@@ -79,6 +91,12 @@ class CacheManager:
         
         # Get data
         candles = list(self._caches[key])
+        
+        if not candles:
+            logger.debug(f"⚠️ Cache EMPTY: {key} has no candles")
+            return []
+        
+        logger.debug(f"✅ Cache HIT: {key} - {len(candles)} candles (latest: {candles[-1][4]})")
         
         if limit:
             return candles[-limit:]
@@ -94,11 +112,11 @@ class CacheManager:
         if self._caches[key] and int(candle[0]) == int(self._caches[key][-1][0]):
             # Update last candle
             self._caches[key][-1] = candle
-            logger.debug(f"Updated last candle for {key}")
+            logger.debug(f"🔄 Updated last candle for {key} @ {candle[4]:.2f}")
         else:
             # Add new candle
             self._caches[key].append(candle)
-            logger.debug(f"Added new candle for {key}")
+            logger.debug(f"➕ Added new candle for {key} @ {candle[4]:.2f} (total: {len(self._caches[key])})")
         
         self._last_update[key] = datetime.now()
     
@@ -111,14 +129,17 @@ class CacheManager:
         # Store as JSON string
         self._caches[key] = deque([orderbook], maxlen=1)
         self._last_update[key] = datetime.now()
+        logger.debug(f"📚 Orderbook cached for {symbol}")
     
     def get_orderbook(self, symbol: str) -> Dict:
         """Get orderbook from cache"""
         key = self._get_key(symbol, "orderbook", "orderbook")
         
         if key not in self._caches or not self._caches[key]:
+            logger.debug(f"❌ Orderbook cache miss for {symbol}")
             return {"bids": [], "asks": []}
         
+        logger.debug(f"✅ Orderbook cache hit for {symbol}")
         return self._caches[key][0]
     
     # ==================== Ticker Cache ====================
@@ -128,14 +149,17 @@ class CacheManager:
         key = self._get_key(symbol, "ticker", "ticker")
         self._caches[key] = deque([ticker], maxlen=1)
         self._last_update[key] = datetime.now()
+        logger.debug(f"📈 Ticker cached for {symbol}")
     
     def get_ticker(self, symbol: str) -> Dict:
         """Get ticker from cache"""
         key = self._get_key(symbol, "ticker", "ticker")
         
         if key not in self._caches or not self._caches[key]:
+            logger.debug(f"❌ Ticker cache miss for {symbol}")
             return {}
         
+        logger.debug(f"✅ Ticker cache hit for {symbol}")
         return self._caches[key][0]
     
     # ==================== Metadata ====================
