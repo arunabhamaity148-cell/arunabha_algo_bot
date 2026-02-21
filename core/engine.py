@@ -60,7 +60,7 @@ class ArunabhaEngine:
         self.daily_signals = 0
         self.consecutive_losses = 0
         
-        # BTC Data cache
+        # BTC Data cache (backup)
         self.btc_cache = {"15m": [], "1h": [], "4h": []}
         self._btc_data_ready = False
         self._btc_fetch_attempts = 0
@@ -100,13 +100,12 @@ class ArunabhaEngine:
         logger.info("✅ Engine started successfully")
     
     async def _force_fetch_btc_data(self) -> bool:
-        """Force fetch BTC data with multiple retries and detailed logging"""
-        for attempt in range(10):  # ১০ বার চেষ্টা
+        """Force fetch BTC data with multiple retries and update cache"""
+        for attempt in range(10):
             try:
                 logger.info(f"🔄 [ATTEMPT {attempt+1}/10] Fetching BTC data...")
                 
-                # Try REST API first
-                logger.info("   📡 Fetching from REST API...")
+                # Fetch from REST
                 btc_15m = await self.rest_client.fetch_ohlcv("BTC/USDT", "15m", 100)
                 btc_1h = await self.rest_client.fetch_ohlcv("BTC/USDT", "1h", 50)
                 btc_4h = await self.rest_client.fetch_ohlcv("BTC/USDT", "4h", 50)
@@ -116,31 +115,35 @@ class ArunabhaEngine:
                 logger.info(f"   BTC 1h: {len(btc_1h) if btc_1h else 0} candles")
                 logger.info(f"   BTC 4h: {len(btc_4h) if btc_4h else 0} candles")
                 
-                # Check if we have enough data
                 if btc_15m and len(btc_15m) >= 50:
+                    # Update engine cache (backup)
                     self.btc_cache["15m"] = btc_15m
                     self.btc_cache["1h"] = btc_1h if btc_1h else []
                     self.btc_cache["4h"] = btc_4h if btc_4h else []
-                    self._btc_data_ready = True
-                    logger.info(f"✅✅ BTC DATA READY! {len(btc_15m)} candles")
                     
-                    # Update regime immediately
+                    # 🔴 FORCE UPDATE WEBSOCKET CACHE
+                    logger.info("   🔄 Force updating WebSocket cache...")
+                    self.cache.set_ohlcv("BTC/USDT", "15m", btc_15m)
+                    if btc_1h:
+                        self.cache.set_ohlcv("BTC/USDT", "1h", btc_1h)
+                    if btc_4h:
+                        self.cache.set_ohlcv("BTC/USDT", "4h", btc_4h)
+                    
+                    # Verify cache
+                    cache_check = self.cache.get_ohlcv("BTC/USDT", "15m")
+                    if cache_check and len(cache_check) >= 50:
+                        logger.info(f"✅ Cache verified: {len(cache_check)} candles for BTC 15m")
+                        self._btc_data_ready = True
+                    else:
+                        logger.error(f"❌ Cache verification failed!")
+                        continue
+                    
+                    # Update regime
                     await self._update_regime()
                     return True
                 else:
                     logger.warning(f"   ⚠️ Only {len(btc_15m) if btc_15m else 0} candles - need 50")
-                
-                # Try WebSocket cache if REST failed
-                ws_candles = self.cache.get_ohlcv("BTC/USDT", "15m")
-                if ws_candles and len(ws_candles) > len(btc_15m or []):
-                    logger.info(f"   📡 Got {len(ws_candles)} candles from WebSocket cache")
-                    self.btc_cache["15m"] = ws_candles
                     
-                    if len(ws_candles) >= 50:
-                        self._btc_data_ready = True
-                        logger.info(f"✅✅ BTC DATA READY from WebSocket! {len(ws_candles)} candles")
-                        return True
-                
             except Exception as e:
                 logger.error(f"   ❌ Attempt {attempt+1} failed: {e}")
             
@@ -164,6 +167,10 @@ class ArunabhaEngine:
                     self.btc_cache["15m"] = btc_15m
                     self.btc_cache["1h"] = await self.rest_client.fetch_ohlcv("BTC/USDT", "1h", 50)
                     self.btc_cache["4h"] = await self.rest_client.fetch_ohlcv("BTC/USDT", "4h", 50)
+                    
+                    # Update cache
+                    self.cache.set_ohlcv("BTC/USDT", "15m", btc_15m)
+                    
                     self._btc_data_ready = True
                     logger.info("✅ Background BTC fetcher succeeded")
                     await self._update_regime()
@@ -214,13 +221,13 @@ class ArunabhaEngine:
                 logger.warning("⚠️ BTC data not ready - skipping regime update")
                 return
             
-            # Get BTC data
-            btc_15m = self.btc_cache.get("15m", [])
-            btc_1h = self.btc_cache.get("1h", [])
-            btc_4h = self.btc_cache.get("4h", [])
+            # Get BTC data from CACHE
+            btc_15m = self.cache.get_ohlcv("BTC/USDT", "15m")
+            btc_1h = self.cache.get_ohlcv("BTC/USDT", "1h")
+            btc_4h = self.cache.get_ohlcv("BTC/USDT", "4h")
             
             if not btc_15m or len(btc_15m) < 30:
-                logger.warning(f"⚠️ Insufficient BTC data for regime: {len(btc_15m)}/30")
+                logger.warning(f"⚠️ Insufficient BTC data for regime: {len(btc_15m) if btc_15m else 0}/30")
                 return
             
             # Detect regimes
@@ -248,7 +255,7 @@ class ArunabhaEngine:
             
             # Update BTC data if this is BTC
             if symbol == "BTC/USDT":
-                self.btc_cache[tf] = candles
+                logger.info(f"✅ BTC {tf} data updated - {len(candles)} candles")
                 if tf == "15m" and len(candles) >= 50 and not self._btc_data_ready:
                     self._btc_data_ready = True
                     logger.info("✅ BTC data now ready from WebSocket")
@@ -305,7 +312,7 @@ class ArunabhaEngine:
         
         logger.info(f"🔍 Checking {symbol} for signal...")
         
-        # Get all required data
+        # Get all required data from CACHE
         data = await self._get_all_data(symbol)
         if not data:
             logger.info(f"❌ {symbol}: No data available")
@@ -343,27 +350,32 @@ class ArunabhaEngine:
             logger.info(f"❌ {symbol}: Signal generation failed")
     
     async def _get_all_data(self, symbol: str) -> Optional[Dict]:
-        """Get all required data for signal generation"""
+        """Get all required data from CACHE for signal generation"""
         
         try:
-            # Get OHLCV data
+            # Get OHLCV data from CACHE (not engine cache)
             ohlcv_5m = self.cache.get_ohlcv(symbol, Timeframes.M5)
             ohlcv_15m = self.cache.get_ohlcv(symbol, Timeframes.M15)
             ohlcv_1h = self.cache.get_ohlcv(symbol, Timeframes.H1)
             ohlcv_4h = self.cache.get_ohlcv(symbol, Timeframes.H4)
             
-            # Get BTC data from cache
-            btc_15m = self.btc_cache.get("15m", [])
-            btc_1h = self.btc_cache.get("1h", [])
-            btc_4h = self.btc_cache.get("4h", [])
+            # Get BTC data from CACHE (not engine cache)
+            btc_15m = self.cache.get_ohlcv("BTC/USDT", Timeframes.M15)
+            btc_1h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H1)
+            btc_4h = self.cache.get_ohlcv("BTC/USDT", Timeframes.H4)
+            
+            # Log what we got
+            logger.debug(f"📊 Data for {symbol}:")
+            logger.debug(f"   {symbol} 15m: {len(ohlcv_15m) if ohlcv_15m else 0} candles")
+            logger.debug(f"   BTC 15m: {len(btc_15m) if btc_15m else 0} candles")
             
             # Validate data
             if not ohlcv_15m:
-                logger.warning(f"⚠️ No 15m data for {symbol}")
+                logger.warning(f"⚠️ No 15m data for {symbol} in cache")
                 return None
             
             if not btc_15m or len(btc_15m) < 30:
-                logger.warning(f"⚠️ Insufficient BTC data: {len(btc_15m) if btc_15m else 0}/30")
+                logger.warning(f"⚠️ Insufficient BTC data in cache: {len(btc_15m) if btc_15m else 0}/30")
                 return None
             
             # Get other data
@@ -431,12 +443,15 @@ class ArunabhaEngine:
     
     def get_status(self) -> Dict:
         """Get engine status"""
+        # Get BTC from cache for status
+        btc_candles = len(self.cache.get_ohlcv("BTC/USDT", "15m"))
+        
         return {
             "market_type": self.market_type.value,
             "btc_regime": self.btc_regime.regime.value if self.btc_regime else "unknown",
             "btc_confidence": self.btc_regime.confidence if self.btc_regime else 0,
             "btc_data_ready": self._btc_data_ready,
-            "btc_candles": len(self.btc_cache.get("15m", [])),
+            "btc_candles": btc_candles,
             "daily_signals": self.daily_signals,
             "daily_limit": self._get_daily_limit(),
             "active_trades": len(self.risk_manager.active_trades),
