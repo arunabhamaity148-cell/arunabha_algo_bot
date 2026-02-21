@@ -30,6 +30,7 @@ class BinanceWSFeed:
         self._connected = False
         self._reconnect_count = 0
         self._btc_received = False
+        self._message_count = 0
         
     def _get_cache_key(self, symbol: str, tf: str) -> Tuple[str, str]:
         """Get cache key for symbol and timeframe"""
@@ -74,7 +75,7 @@ class BinanceWSFeed:
         """Update cache with new candle"""
         key = self._get_cache_key(symbol, tf)
         if key not in self._cache:
-            logger.debug(f"🆕 Creating new cache for {symbol} {tf}")
+            logger.info(f"🆕 Creating new cache for {symbol} {tf}")
             self._cache[key] = deque(maxlen=config.CACHE_SIZE)
         
         # Check if this candle exists (update) or is new
@@ -82,11 +83,11 @@ class BinanceWSFeed:
         if cached and int(candle[0]) == int(cached[-1][0]):
             # Update last candle
             self._cache[key][-1] = candle
-            logger.debug(f"🔄 Updated last candle for {symbol} {tf} @ {candle[4]:.2f}")
+            logger.info(f"🔄 UPDATED: {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
         else:
             # Add new candle
             self._cache[key].append(candle)
-            logger.debug(f"➕ New candle for {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
+            logger.info(f"➕ ADDED: {symbol} {tf} @ {candle[4]:.2f} (total: {len(self._cache[key])})")
             
             # Track BTC reception
             if symbol == "BTC/USDT" and tf == "15m":
@@ -327,10 +328,15 @@ class WebSocketManager:
         self._connected = False
     
     async def _handle_message(self, raw: str):
-        """Handle incoming WebSocket message"""
+        """Handle incoming WebSocket message with detailed logging"""
         try:
+            self.feed._message_count += 1
             data = json.loads(raw)
             stream_data = data.get("data", {})
+            
+            # Log every 100th message for debugging
+            if self.feed._message_count % 100 == 0:
+                logger.info(f"📊 WebSocket messages received: {self.feed._message_count}")
             
             # Parse kline
             parsed = self.feed._parse_kline(stream_data)
@@ -342,14 +348,23 @@ class WebSocketManager:
             candle = parsed["candle"]
             is_closed = parsed["is_closed"]
             
+            # 🔴 FORCE LOG - WebSocket data আসছে কিনা চেক করো
+            logger.info(f"📡 WEBSOCKET RAW: {symbol} {tf} @ {candle[4]:.2f} closed={is_closed}")
+            
             # Update cache
             self.feed.update_cache(symbol, tf, candle)
+            
+            # 🔴 ক্যাশে আপডেট হয়েছে কিনা চেক করো
+            key = self.feed._get_cache_key(symbol, tf)
+            cache_size = len(self.feed._cache.get(key, []))
+            logger.info(f"📦 CACHE UPDATE: {symbol} {tf} now has {cache_size} candles")
             
             # Trigger callback on candle close
             if is_closed and self.feed.on_candle_close:
                 try:
                     candles = self.feed.get_ohlcv(symbol, tf)
-                    if candles:
+                    if candles and len(candles) > 0:
+                        logger.info(f"🔔 CALLBACK: {symbol} {tf} with {len(candles)} candles")
                         await self.feed.on_candle_close(symbol, tf, candles)
                     else:
                         logger.warning(f"⚠️ No candles for {symbol} {tf} in callback")
@@ -360,6 +375,8 @@ class WebSocketManager:
             logger.debug("⚠️ Invalid JSON received")
         except Exception as e:
             logger.error(f"❌ Message handling error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def is_connected(self) -> bool:
         """Check if WebSocket is connected"""
@@ -382,6 +399,7 @@ class WebSocketManager:
         return {
             "connected": self._connected,
             "retry_count": self._retry_count,
+            "message_count": self.feed._message_count,
             "btc_received": self.feed._btc_received,
             "btc_15m_candles": btc_candles,
             "total_candles": total,
