@@ -29,6 +29,7 @@ class BinanceWSFeed:
         self._stop_event = asyncio.Event()
         self._connected = False
         self._reconnect_count = 0
+        self._btc_received = False
         
     def _get_cache_key(self, symbol: str, tf: str) -> Tuple[str, str]:
         return (symbol, tf)
@@ -39,6 +40,7 @@ class BinanceWSFeed:
             for tf in timeframes:
                 key = self._get_cache_key(symbol, tf)
                 self._cache[key] = deque(maxlen=config.CACHE_SIZE)
+        logger.info(f"✅ Cache initialized for {len(symbols)} symbols x {len(timeframes)} timeframes")
     
     def get_ohlcv(self, symbol: str, tf: str) -> List[List[float]]:
         """Get cached OHLCV data"""
@@ -58,9 +60,16 @@ class BinanceWSFeed:
         if cached and int(candle[0]) == int(cached[-1][0]):
             # Update last candle
             self._cache[key][-1] = candle
+            logger.debug(f"🔄 Updated last candle for {symbol} {tf}")
         else:
             # Add new candle
             self._cache[key].append(candle)
+            logger.debug(f"➕ New candle for {symbol} {tf} @ {candle[4]:.2f}")
+            
+            # Track BTC reception
+            if symbol == "BTC/USDT" and tf == "15m":
+                self._btc_received = True
+                logger.info(f"✅ First BTC 15m candle received")
     
     async def seed_from_rest(self, rest_client):
         """Seed cache from REST API"""
@@ -69,18 +78,30 @@ class BinanceWSFeed:
         symbols = config.TRADING_PAIRS + ["BTC/USDT"]
         self._init_cache(symbols, config.TIMEFRAMES)
         
+        # Seed BTC first
+        try:
+            btc_candles = await rest_client.fetch_ohlcv("BTC/USDT", "15m", limit=config.CACHE_SIZE)
+            if btc_candles:
+                key = self._get_cache_key("BTC/USDT", "15m")
+                self._cache[key].extend(btc_candles)
+                logger.info(f"✅ Seeded BTC 15m: {len(btc_candles)} candles")
+                self._btc_received = True
+        except Exception as e:
+            logger.error(f"❌ BTC seed failed: {e}")
+        
+        # Then other symbols
         for symbol in symbols:
+            if symbol == "BTC/USDT":
+                continue
             for tf in config.TIMEFRAMES:
                 try:
-                    candles = await rest_client.fetch_ohlcv(
-                        symbol, tf, limit=config.CACHE_SIZE
-                    )
+                    candles = await rest_client.fetch_ohlcv(symbol, tf, limit=config.CACHE_SIZE)
                     if candles:
                         key = self._get_cache_key(symbol, tf)
                         self._cache[key].extend(candles)
-                        logger.debug(f"Seeded {symbol} {tf}: {len(candles)} candles")
+                        logger.debug(f"✅ Seeded {symbol} {tf}: {len(candles)} candles")
                 except Exception as e:
-                    logger.warning(f"Seed failed {symbol} {tf}: {e}")
+                    logger.warning(f"⚠️ Seed failed {symbol} {tf}: {e}")
         
         logger.info("🌱 Seeding complete")
     
@@ -97,6 +118,7 @@ class BinanceWSFeed:
             for tf in config.TIMEFRAMES:
                 streams.append(self._symbol_to_stream(symbol, tf))
         
+        logger.info(f"📡 Subscribing to {len(streams)} streams")
         return streams
     
     def _parse_kline(self, data: Dict) -> Optional[Dict]:
@@ -120,7 +142,7 @@ class BinanceWSFeed:
                 "is_closed": k.get("x", False)
             }
         except Exception as e:
-            logger.error(f"Kline parse error: {e}")
+            logger.error(f"❌ Kline parse error: {e}")
             return None
 
 
@@ -166,12 +188,12 @@ class WebSocketManager:
                 self._retry_count += 1
                 
                 if self._retry_count > self._max_retries:
-                    logger.error(f"Max retries ({self._max_retries}) reached")
+                    logger.error(f"❌ Max retries ({self._max_retries}) reached")
                     break
                 
                 wait_time = self._reconnect_delay * (2 ** (self._retry_count - 1))
                 logger.warning(
-                    f"WebSocket error: {e} - "
+                    f"⚠️ WebSocket error: {e} - "
                     f"Reconnecting in {wait_time}s (attempt {self._retry_count}/{self._max_retries})"
                 )
                 
@@ -183,7 +205,7 @@ class WebSocketManager:
         stream_names = "/".join(streams)
         url = f"wss://fstream.binance.com/stream?streams={stream_names}"
         
-        logger.info(f"Connecting to WebSocket: {len(streams)} streams")
+        logger.info(f"🔌 Connecting to WebSocket: {len(streams)} streams")
         
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
@@ -202,7 +224,7 @@ class WebSocketManager:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         await self._handle_message(msg.data)
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        logger.warning("WebSocket closed/error")
+                        logger.warning("⚠️ WebSocket closed/error")
                         break
         
         self._connected = False
@@ -232,12 +254,12 @@ class WebSocketManager:
                     candles = self.feed.get_ohlcv(symbol, tf)
                     await self.feed.on_candle_close(symbol, tf, candles)
                 except Exception as e:
-                    logger.error(f"Callback error: {e}")
+                    logger.error(f"❌ Callback error: {e}")
             
         except json.JSONDecodeError:
-            logger.debug("Invalid JSON received")
+            logger.debug("⚠️ Invalid JSON received")
         except Exception as e:
-            logger.error(f"Message handling error: {e}")
+            logger.error(f"❌ Message handling error: {e}")
     
     def is_connected(self) -> bool:
         """Check if WebSocket is connected"""
@@ -248,5 +270,6 @@ class WebSocketManager:
         return {
             "connected": self._connected,
             "retry_count": self._retry_count,
+            "btc_received": self.feed._btc_received,
             "cache_size": sum(len(q) for q in self.feed._cache.values())
         }
