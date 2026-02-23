@@ -38,7 +38,7 @@ class ArunabhaEngine:
         self.telegram = telegram or TelegramNotifier()
         
         # Initialize components
-        self.ws_manager = WebSocketManager(self._on_candle_close)
+        self.ws_manager = WebSocketManager(self._on_candle_close)  # এই লাইন ঠিক আছে
         self.rest_client = RESTClient()
         self.cache = CacheManager()
         
@@ -298,6 +298,7 @@ async def _update_regime(self):
     except Exception as e:
         logger.error(f"❌ Regime update failed: {e}")
 
+# 🔴 এই মেথডটা যোগ করা হলো - এটাই missing ছিল!
 async def _on_candle_close(self, symbol: str, tf: str, candles: List[List[float]]):
     """
     Callback when candle closes
