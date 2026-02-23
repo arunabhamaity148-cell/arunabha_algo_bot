@@ -95,14 +95,12 @@ class Tier1Filters:
         if not btc_regime.can_trade:
             return False, f"BTC regime blocks: {btc_regime.reason}"
         
-        # If direction specified, check alignment
         if direction:
             if direction == "LONG" and btc_regime.direction == "DOWN":
                 return False, f"BTC {btc_regime.direction} but trying LONG"
             if direction == "SHORT" and btc_regime.direction == "UP":
                 return False, f"BTC {btc_regime.direction} but trying SHORT"
         
-        # Check confidence
         if btc_regime.confidence < 20:
             return False, f"BTC confidence too low: {btc_regime.confidence}%"
         
@@ -119,7 +117,6 @@ class Tier1Filters:
         detector = StructureDetector()
         structure = detector.detect(ohlcv)
         
-        # Must have clear structure
         if structure.strength == "WEAK" and not structure.bos_detected:
             return False, f"Structure too weak: {structure.reason}"
         
@@ -132,45 +129,50 @@ class Tier1Filters:
         if len(ohlcv) < 20:
             return False, "Insufficient data for volume check (need 20 candles)"
         
-        recent_volumes = [c[5] for c in ohlcv[-5:]]
+        recent_volumes = [float(c[5]) for c in ohlcv[-5:]]
         avg_volume = sum(recent_volumes[:-1]) / (len(recent_volumes)-1) if len(recent_volumes) > 1 else recent_volumes[0]
         current_volume = recent_volumes[-1]
         
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
         
-        # Volume must be at least 70% of average
         if volume_ratio < 0.7:
             return False, f"Volume too low: {volume_ratio:.1f}x average"
         
         return True, f"Volume: {volume_ratio:.1f}x average"
     
     def _check_liquidity(self, data: Dict[str, Any]) -> Tuple[bool, str]:
-        """Check liquidity conditions"""
+        """Check liquidity conditions - FIXED VERSION"""
         
         orderbook = data.get("orderbook", {})
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
         
         if not bids or not asks:
-            return True, "No orderbook data - allowing"  # Optional if no data
+            return True, "No orderbook data - allowing"
         
-        # Check spread
-        best_bid = bids[0][0] if bids else 0
-        best_ask = asks[0][0] if asks else 0
+        # 🔴 ফিক্স: সব ভ্যালুকে float করো
+        try:
+            best_bid = float(bids[0][0]) if bids and len(bids[0]) > 0 else 0
+            best_ask = float(asks[0][0]) if asks and len(asks[0]) > 0 else 0
+        except (TypeError, ValueError):
+            return True, "Invalid orderbook data - allowing"
         
+        spread_pct = 0
         if best_bid and best_ask:
-            spread_pct = (best_ask - best_bid) / best_bid * 100
-            if spread_pct > 0.1:  # Spread > 0.1%
+            spread_pct = ((best_ask - best_bid) / best_bid) * 100
+            if spread_pct > 0.1:
                 return False, f"Spread too wide: {spread_pct:.3f}%"
         
-        # Check market depth
-        bid_depth = sum(b[1] for b in bids[:5])
-        ask_depth = sum(a[1] for a in asks[:5])
+        # ভলিউমও float করো
+        try:
+            bid_depth = sum(float(b[1]) for b in bids[:5] if len(b) > 1)
+            ask_depth = sum(float(a[1]) for a in asks[:5] if len(a) > 1)
+        except (TypeError, ValueError):
+            bid_depth, ask_depth = 0, 0
         
-        if bid_depth < 10000 or ask_depth < 10000:  # Less than $10k depth
+        if bid_depth < 10000 or ask_depth < 10000:
             return False, f"Insufficient depth: Bid ${bid_depth:,.0f}, Ask ${ask_depth:,.0f}"
         
-        spread_pct = (best_ask - best_bid) / best_bid * 100 if best_bid else 0
         return True, f"Spread: {spread_pct:.3f}%, Depth: ${bid_depth+ask_depth:,.0f}"
     
     def _check_session(self) -> Tuple[bool, str]:
@@ -182,12 +184,10 @@ class Tier1Filters:
         now = datetime.now(pytz.timezone('Asia/Kolkata'))
         hour = now.hour
         
-        # Check if in avoid times
         for start, end, name in config.AVOID_TIMES:
             if start <= hour < end:
                 return False, f"Avoid time: {name} ({hour:02d}:00-{end:02d}:00 IST)"
         
-        # Determine current session
         if 7 <= hour < 11:
             return True, f"Active session: ASIA ({hour:02d}:00 IST)"
         elif 13 <= hour < 17:
