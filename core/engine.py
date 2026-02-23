@@ -89,8 +89,8 @@ class ArunabhaEngine:
             logger.error("❌ BTC data failed to load - will retry in background")
             asyncio.create_task(self._background_btc_fetcher())
         
-        # 🔴 ফোর্স ফেচ অল পেয়ারস
-        logger.info("🔄 Force fetching ALL pairs data...")
+        # 🔴 ফোর্স ফেচ অল পেয়ারস - প্রতিটি পেয়ারের জন্য আলাদাভাবে
+        logger.info("🔄 ===== FORCE FETCHING ALL PAIRS DATA =====")
         await self._force_fetch_all_pairs()
         
         # Start WebSocket
@@ -103,19 +103,51 @@ class ArunabhaEngine:
         logger.info("✅ Engine started successfully")
     
     async def _force_fetch_all_pairs(self):
-        """Force fetch data for all trading pairs using REST API"""
-        for symbol in config.TRADING_PAIRS:
-            if symbol == "BTC/USDT":
-                continue
-            for tf in ["5m", "15m", "1h", "4h"]:
+        """Force fetch data for all trading pairs using REST API - বুলেট-প্রুফ ভার্সন"""
+        
+        symbols = ["ETH/USDT", "DOGE/USDT", "SOL/USDT", "RENDER/USDT"]
+        timeframes = ["5m", "15m", "1h", "4h"]
+        
+        for symbol in symbols:
+            logger.info(f"📡 Processing {symbol}...")
+            for tf in timeframes:
                 try:
+                    # REST API থেকে ডেটা আনার চেষ্টা
+                    logger.info(f"   Fetching {symbol} {tf}...")
                     candles = await self.rest_client.fetch_ohlcv_rest(symbol, tf, 100)
-                    if candles:
+                    
+                    if candles and len(candles) > 0:
+                        # cache-এ সংরক্ষণ
                         self.cache.set_ohlcv(symbol, tf, candles)
-                        logger.info(f"✅ Pre-fetched {symbol} {tf}: {len(candles)} candles")
-                    await asyncio.sleep(0.5)  # Rate limit avoidance
+                        logger.info(f"   ✅ {symbol} {tf}: {len(candles)} candles cached")
+                        
+                        # ভেরিফিকেশন
+                        verify = self.cache.get_ohlcv(symbol, tf)
+                        if verify:
+                            logger.info(f"      ✅ Verified: {len(verify)} candles")
+                    else:
+                        logger.warning(f"   ⚠️ No data for {symbol} {tf}")
+                    
+                    # Rate limit এড়াতে সামান্য বিরতি
+                    await asyncio.sleep(0.3)
+                    
                 except Exception as e:
-                    logger.error(f"❌ Failed to fetch {symbol} {tf}: {e}")
+                    logger.error(f"   ❌ Failed to fetch {symbol} {tf}: {e}")
+                    continue
+            
+            logger.info(f"✅ Completed {symbol}")
+        
+        # ফাইনাল ভেরিফিকেশন
+        logger.info("🔍 Final cache verification:")
+        for symbol in symbols:
+            for tf in ["15m"]:
+                candles = self.cache.get_ohlcv(symbol, tf)
+                if candles:
+                    logger.info(f"   ✅ {symbol} {tf}: {len(candles)} candles")
+                else:
+                    logger.error(f"   ❌ {symbol} {tf}: NO DATA!")
+        
+        logger.info("✅ Force fetch all pairs completed")
     
     async def _force_fetch_btc_data(self) -> bool:
         """Force fetch BTC data with multiple retries and update cache"""
