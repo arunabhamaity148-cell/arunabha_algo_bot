@@ -87,9 +87,10 @@ class ArunabhaEngine:
             logger.info("✅ BTC data loaded successfully")
         else:
             logger.error("❌ BTC data failed to load - will retry in background")
+            # Start background BTC fetcher
             asyncio.create_task(self._background_btc_fetcher())
         
-        # 🔴 ফোর্স ফেচ অল পেয়ারস - প্রতিটি পেয়ারের জন্য আলাদাভাবে
+        # 🔴 ফোর্স ফেচ অল পেয়ারস - এইটা জরুরি!
         logger.info("🔄 ===== FORCE FETCHING ALL PAIRS DATA =====")
         await self._force_fetch_all_pairs()
         
