@@ -1,10 +1,11 @@
 """
 ARUNABHA ALGO BOT - REST Client
-Handles all REST API calls to exchanges
+Handles all REST API calls to exchanges with backup support
 """
 
 import asyncio
 import logging
+import aiohttp
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 
@@ -16,13 +17,16 @@ logger = logging.getLogger(__name__)
 
 class RESTClient:
     """
-    Async REST client for exchange data
+    Async REST client for exchange data with REST API backup
     """
     
     def __init__(self):
         self.exchange: Optional[ccxt.Exchange] = None
         self._rate_limiter = asyncio.Semaphore(10)  # Max 10 concurrent requests
         self._connection_attempts = 0
+        
+        # Binance REST API base URL
+        self.binance_rest_url = "https://api.binance.com/api/v3"
         
     async def connect(self):
         """Connect to exchange"""
@@ -61,12 +65,13 @@ class RESTClient:
         since: Optional[int] = None
     ) -> List[List[float]]:
         """
-        Fetch OHLCV data
+        Fetch OHLCV data - tries WebSocket cache first, then REST API
         Returns: List of [timestamp, open, high, low, close, volume]
         """
+        # Try REST API backup first if no exchange connection
         if not self.exchange:
-            logger.warning(f"⚠️ Exchange not connected, attempting reconnect...")
-            await self.connect()
+            logger.warning(f"⚠️ Exchange not connected, using REST API backup for {symbol}")
+            return await self.fetch_ohlcv_rest(symbol, timeframe, limit)
         
         async with self._rate_limiter:
             try:
@@ -79,24 +84,82 @@ class RESTClient:
                 )
                 
                 if ohlcv:
-                    logger.debug(f"📊 Fetched {len(ohlcv)} candles for {symbol} {timeframe}")
+                    logger.debug(f"📊 CCXT: Fetched {len(ohlcv)} candles for {symbol} {timeframe}")
+                    return ohlcv
                 else:
-                    logger.warning(f"⚠️ No data for {symbol} {timeframe}")
-                
-                return ohlcv
+                    logger.warning(f"⚠️ No data from CCXT for {symbol} {timeframe}, trying REST API")
+                    return await self.fetch_ohlcv_rest(symbol, timeframe, limit)
                 
             except ccxt.RateLimitExceeded as e:
                 logger.warning(f"⚠️ Rate limit exceeded for {symbol}: {e}")
                 await asyncio.sleep(10)
-                return []
+                return await self.fetch_ohlcv_rest(symbol, timeframe, limit)
                 
             except ccxt.NetworkError as e:
                 logger.warning(f"⚠️ Network error for {symbol}: {e}")
-                return []
+                return await self.fetch_ohlcv_rest(symbol, timeframe, limit)
                 
             except Exception as e:
-                logger.error(f"❌ OHLCV fetch error {symbol}: {e}")
-                return []
+                logger.error(f"❌ CCXT fetch error {symbol}: {e}")
+                return await self.fetch_ohlcv_rest(symbol, timeframe, limit)
+    
+    async def fetch_ohlcv_rest(self, symbol: str, timeframe: str = "15m", limit: int = 100) -> List[List[float]]:
+        """
+        REST API দিয়ে সরাসরি Binance থেকে ডেটা আনা (WebSocket/CCXT ব্যাকআপ)
+        """
+        try:
+            # Binance API URL
+            url = f"{self.binance_rest_url}/klines"
+            
+            # সিম্বল ফরম্যাট ঠিক করা (RENDER/USDT → RENDERUSDT)
+            symbol_raw = symbol.replace("/", "").upper()
+            
+            # Timeframe mapping
+            tf_map = {
+                "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+                "1h": "1h", "4h": "4h", "1d": "1d"
+            }
+            interval = tf_map.get(timeframe, "15m")
+            
+            params = {
+                "symbol": symbol_raw,
+                "interval": interval,
+                "limit": limit
+            }
+            
+            logger.info(f"📡 REST API fetch: {symbol} {timeframe}")
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        
+                        # Binance ফরম্যাট থেকে আমাদের ফরম্যাটে convert
+                        candles = []
+                        for item in data:
+                            candle = [
+                                item[0],  # timestamp
+                                float(item[1]),  # open
+                                float(item[2]),  # high
+                                float(item[3]),  # low
+                                float(item[4]),  # close
+                                float(item[5])   # volume
+                            ]
+                            candles.append(candle)
+                        
+                        logger.info(f"✅ REST API success: {len(candles)} candles for {symbol} {timeframe}")
+                        return candles
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"❌ REST API error {resp.status}: {error_text}")
+                        return []
+                        
+        except aiohttp.ClientError as e:
+            logger.error(f"❌ REST API connection error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"❌ REST API exception: {e}")
+            return []
     
     async def fetch_orderbook(
         self,
@@ -108,6 +171,7 @@ class RESTClient:
         Returns: {'bids': [[price, amount], ...], 'asks': [[price, amount], ...]}
         """
         if not self.exchange:
+            logger.warning(f"⚠️ Exchange not connected, using mock orderbook for {symbol}")
             return {"bids": [], "asks": []}
         
         async with self._rate_limiter:
@@ -121,6 +185,34 @@ class RESTClient:
             except Exception as e:
                 logger.warning(f"⚠️ Orderbook fetch error {symbol}: {e}")
                 return {"bids": [], "asks": []}
+    
+    async def fetch_orderbook_rest(self, symbol: str, limit: int = 20) -> Dict[str, List]:
+        """
+        REST API দিয়ে orderbook আনা (ব্যাকআপ)
+        """
+        try:
+            url = f"{self.binance_rest_url}/depth"
+            symbol_raw = symbol.replace("/", "").upper()
+            
+            params = {
+                "symbol": symbol_raw,
+                "limit": limit
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return {
+                            "bids": data.get("bids", [])[:limit],
+                            "asks": data.get("asks", [])[:limit]
+                        }
+                    else:
+                        return {"bids": [], "asks": []}
+                        
+        except Exception as e:
+            logger.error(f"❌ Orderbook REST error: {e}")
+            return {"bids": [], "asks": []}
     
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         """Fetch current ticker"""
@@ -175,8 +267,6 @@ class RESTClient:
     async def fetch_fear_greed_index(self) -> int:
         """Fetch Fear & Greed Index"""
         try:
-            import aiohttp
-            
             async with aiohttp.ClientSession() as session:
                 async with session.get(config.FEAR_GREED_API_URL) as resp:
                     if resp.status == 200:
@@ -219,20 +309,12 @@ class RESTClient:
         """
         Fetch historical data for backtesting
         """
-        if not self.exchange:
-            return []
-        
-        # Calculate since time
-        since = self.exchange.parse8601(
-            (datetime.now() - timedelta(days=days)).isoformat()
-        )
-        
         all_candles = []
-        current_since = since
+        current_since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
         
         while True:
-            candles = await self.fetch_ohlcv(
-                symbol, timeframe, limit=1000, since=current_since
+            candles = await self.fetch_ohlcv_rest(
+                symbol, timeframe, limit=1000
             )
             
             if not candles:
