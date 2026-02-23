@@ -87,8 +87,11 @@ class ArunabhaEngine:
             logger.info("✅ BTC data loaded successfully")
         else:
             logger.error("❌ BTC data failed to load - will retry in background")
-            # Start background BTC fetcher
             asyncio.create_task(self._background_btc_fetcher())
+        
+        # 🔴 ফোর্স ফেচ অল পেয়ারস
+        logger.info("🔄 Force fetching ALL pairs data...")
+        await self._force_fetch_all_pairs()
         
         # Start WebSocket
         logger.info("🔌 Starting WebSocket connection...")
@@ -98,6 +101,21 @@ class ArunabhaEngine:
         await self._update_regime()
         
         logger.info("✅ Engine started successfully")
+    
+    async def _force_fetch_all_pairs(self):
+        """Force fetch data for all trading pairs using REST API"""
+        for symbol in config.TRADING_PAIRS:
+            if symbol == "BTC/USDT":
+                continue
+            for tf in ["5m", "15m", "1h", "4h"]:
+                try:
+                    candles = await self.rest_client.fetch_ohlcv_rest(symbol, tf, 100)
+                    if candles:
+                        self.cache.set_ohlcv(symbol, tf, candles)
+                        logger.info(f"✅ Pre-fetched {symbol} {tf}: {len(candles)} candles")
+                    await asyncio.sleep(0.5)  # Rate limit avoidance
+                except Exception as e:
+                    logger.error(f"❌ Failed to fetch {symbol} {tf}: {e}")
     
     async def _force_fetch_btc_data(self) -> bool:
         """Force fetch BTC data with multiple retries and update cache"""
@@ -425,7 +443,6 @@ class ArunabhaEngine:
             
             if rest_fetched:
                 logger.info(f"✅ REST API fetched data for {symbol}")
-                # Regime update if BTC data was fetched
                 if btc_15m and len(btc_15m) >= 30 and not self._btc_data_ready:
                     self._btc_data_ready = True
                     await self._update_regime()
@@ -520,7 +537,6 @@ class ArunabhaEngine:
     
     def get_status(self) -> Dict:
         """Get engine status"""
-        # Get BTC from cache for status
         btc_candles = len(self.cache.get_ohlcv("BTC/USDT", Timeframes.M15.value))
         
         return {
