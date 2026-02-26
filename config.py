@@ -1,6 +1,11 @@
 """
-ARUNABHA ALGO BOT v4.0 - Master Configuration
-All settings in one place
+ARUNABHA ALGO BOT v4.1 - Master Configuration (FIXED)
+
+FIXES:
+- validate_all() এখন import এর সময় চলে না
+- Dead zone midnight bug fix (23-1 → 23-24 + 0-1)
+- GST calculation ঠিক করা হয়েছে
+- Fear & Greed low-end block (< 15) যোগ করা হয়েছে
 """
 
 import os
@@ -8,7 +13,6 @@ import logging
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 
-# Initialize logger first
 logger = logging.getLogger(__name__)
 
 # ==================== Environment ====================
@@ -22,10 +26,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ✅ FIX: এখন import এর সময় raise করে না — main.py তে validate করা হবে
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logger.error("Telegram credentials not set in environment")
-    if ENV == "development":
-        raise ValueError("Telegram credentials not set in environment")
+    logger.warning("⚠️ Telegram credentials not set in environment")
 
 # ==================== Exchange ====================
 
@@ -33,16 +36,17 @@ PRIMARY_EXCHANGE = "binance"
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
 
-# For Indian profit calculation
+# Indian profit calculation
 INDIAN_EXCHANGE = "CoinDCX"
-TDS_RATE = 1.0  # 1% TDS on profit
-GST_RATE = 18.0  # 18% GST on brokerage
+TDS_RATE = 1.0   # 1% TDS on profit
+BROKERAGE_RATE = 0.05  # 0.05% brokerage (CoinDCX)
+GST_RATE = 18.0  # 18% GST on brokerage only
 
 # ==================== Trading Pairs ====================
 
 TRADING_PAIRS: List[str] = [
     "BTC/USDT",
-    "ETH/USDT", 
+    "ETH/USDT",
     "DOGE/USDT",
     "SOL/USDT",
     "RENDER/USDT"
@@ -55,17 +59,16 @@ TERTIARY_TFS = ["4h"]
 
 # ==================== Capital & Risk ====================
 
-ACCOUNT_SIZE = float(os.getenv("ACCOUNT_SIZE", "100000"))  # ₹1,00,000
+ACCOUNT_SIZE = float(os.getenv("ACCOUNT_SIZE", "100000"))   # ₹1,00,000
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "1.0"))  # 1% = ₹1000
 MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "15"))
 
-# Position sizing
-MAX_POSITION_PCT = 30  # Max 30% of account in one trade
-MIN_POSITION_SIZE = 10  # Minimum $10 position
+MAX_POSITION_PCT = 30
+MIN_POSITION_SIZE = 10
 
 # ==================== Trade Limits ====================
 
-MAX_CONCURRENT = 1  # Only one trade at a time (manual)
+MAX_CONCURRENT = 1
 MAX_SIGNALS_PER_DAY = {
     "default": 4,
     "trending": 5,
@@ -84,31 +87,30 @@ SESSION_SIGNAL_LIMITS = {
 # ==================== ATR Settings ====================
 
 ATR_PERIOD = 14
-ATR_SL_MULT = 1.5  # Stop Loss multiplier
-ATR_TP_MULT = 3.0  # Take Profit multiplier
-MIN_ATR_PCT = 0.4  # Min ATR % for trade
-MAX_ATR_PCT = 3.0  # Max ATR % for trade
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 3.0
+MIN_ATR_PCT = 0.4
+MAX_ATR_PCT = 3.0
 
 # ==================== Risk Management ====================
 
-MAX_DAILY_DRAWDOWN_PCT = -2.0  # Stop after -2% in a day
-MAX_CONSECUTIVE_LOSSES = 2  # Stop after 2 consecutive losses
-BREAK_EVEN_AT_R = 0.5  # Move SL to entry at 0.5R
-PARTIAL_EXIT_AT_R = 1.0  # Take 50% profit at 1.0R
-COOLDOWN_MINUTES = 15  # Wait 15 min after trade
+MAX_DAILY_DRAWDOWN_PCT = -2.0
+MAX_CONSECUTIVE_LOSSES = 2
+BREAK_EVEN_AT_R = 0.5
+PARTIAL_EXIT_AT_R = 1.0
+COOLDOWN_MINUTES = 15
+TRAILING_STOP_ATR_MULT = 1.5   # ✅ NEW: Trailing stop = 1.5x ATR
 
 # ==================== Filters ====================
 
-# Tier 1: Mandatory filters (must pass all)
 TIER1_FILTERS = [
     "btc_regime",
     "structure",
     "volume",
-    "liquidity", 
+    "liquidity",
     "session"
 ]
 
-# Tier 2: Quality filters (weighted scoring)
 TIER2_FILTERS = {
     "mtf_confirmation": 20,
     "volume_profile": 15,
@@ -121,7 +123,6 @@ TIER2_FILTERS = {
     "support_resistance": 5
 }
 
-# Tier 3: Bonus filters
 TIER3_FILTERS = [
     "whale_movement",
     "liquidity_grab",
@@ -131,9 +132,8 @@ TIER3_FILTERS = [
     "fibonacci_level"
 ]
 
-# Filter thresholds
-MIN_TIER2_SCORE = 60  # Need 60% to pass
-MIN_TIER3_BONUS = 0  # Bonus points add to score
+MIN_TIER2_SCORE = 60
+MIN_TIER3_BONUS = 0
 
 # ==================== Signal Scoring ====================
 
@@ -146,10 +146,10 @@ SIGNAL_GRADES = {
     "D": 0
 }
 
-MIN_SIGNAL_SCORE = 60  # Minimum score for any signal
-STRONG_SIGNAL_SCORE = 75  # Score for strong signal
-MIN_RR_RATIO = 1.5  # Minimum Risk-Reward Ratio
-ENTRY_CONFIRMATION_WAIT = True  # Wait for confirmation
+MIN_SIGNAL_SCORE = 60
+STRONG_SIGNAL_SCORE = 75
+MIN_RR_RATIO = 1.5
+ENTRY_CONFIRMATION_WAIT = True
 
 # ==================== Market Regime ====================
 
@@ -216,20 +216,20 @@ VOLUME_MULT = 1.2
 # ==================== Confidence Thresholds ====================
 
 CONFIDENCE = {
-    "MIN_CONFIDENCE_ALLOW": 25,      # ২৫% কনফিডেন্স থাকলে ট্রেড করতে দেবে
-    "MIN_CONFIDENCE_DIRECTION": 30,   # ডিরেকশন মিসম্যাচ হলেও ট্রেড করবে
-    "MIN_CONFIDENCE_FORCE": 20,       # ফোর্স ট্রেডের জন্য
-    "ADX_HIGH_CONFIDENCE": 25,        # ADX ২৫+ হলে হাই কনফিডেন্স
-    "ADX_MED_CONFIDENCE": 20,         # ADX ২০-২৫ মিড কনফিডেন্স
+    "MIN_CONFIDENCE_ALLOW": 25,
+    "MIN_CONFIDENCE_DIRECTION": 30,
+    "MIN_CONFIDENCE_FORCE": 20,
+    "ADX_HIGH_CONFIDENCE": 25,
+    "ADX_MED_CONFIDENCE": 20,
 }
 
 # ==================== Sessions (IST) ====================
 
 SESSIONS = {
-    "asia": (7, 11),      # 7AM - 11AM IST
-    "london": (13, 17),   # 1PM - 5PM IST
-    "ny": (18, 22),       # 6PM - 10PM IST
-    "overlap": (22, 24)   # 10PM - 12AM IST
+    "asia": (7, 11),
+    "london": (13, 17),
+    "ny": (18, 22),
+    "overlap": (22, 24)
 }
 
 BEST_TIMES = [
@@ -238,25 +238,30 @@ BEST_TIMES = [
     (7, 9, "Asia Open")
 ]
 
+# ✅ FIX: Dead zone midnight bug fix
+# আগে (23, 1) ছিল — এটা কাজ করে না
+# এখন দুটো আলাদা entry
 AVOID_TIMES = [
     (10, 11, "Lunch"),
-    (23, 1, "Dead Zone")
+    (23, 24, "Late Night"),   # ✅ FIXED
+    (0, 1, "Early Morning")   # ✅ FIXED
 ]
 
 # ==================== Fear & Greed ====================
 
 FEAR_GREED_API_URL = "https://api.alternative.me/fng/?limit=1"
-FEAR_INDEX_STOP = 75  # Don't trade above 75 (extreme greed)
+FEAR_INDEX_STOP = 75     # Don't trade above 75 (extreme greed)
+FEAR_INDEX_MIN = 15      # ✅ NEW: Don't trade below 15 (extreme fear — too risky)
 
 # ==================== WebSocket ====================
 
-WS_RECONNECT_DELAY = 5  # Seconds
+WS_RECONNECT_DELAY = 5
 WS_MAX_RETRIES = 10
 WS_PING_INTERVAL = 20
 
 # ==================== Cache ====================
 
-CACHE_SIZE = 100  # Candles per symbol per timeframe
+CACHE_SIZE = 100
 REDIS_URL = os.getenv("REDIS_URL", None)
 USE_REDIS = REDIS_URL is not None
 
@@ -267,14 +272,14 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default-secret-change-this")
 
 # ==================== Profit Target ====================
 
-DAILY_PROFIT_TARGET = 500  # ₹500 per day
-WEEKLY_PROFIT_TARGET = 2500  # ₹2500 per week
-MONTHLY_PROFIT_TARGET = 10000  # ₹10000 per month
+DAILY_PROFIT_TARGET = 500
+WEEKLY_PROFIT_TARGET = 2500
+MONTHLY_PROFIT_TARGET = 10000
 
 # ==================== Crash Mode ====================
 
 CRASH_MODE = {
-    "ACTIVE": False,  # True করলে ক্র্যাশ মোড চালু হবে
+    "ACTIVE": False,
     "MIN_CONFIDENCE": 15,
     "RISK_MULTIPLIER": 0.5,
     "MAX_POSITION_SIZE": 0.3,
@@ -287,12 +292,13 @@ LOG_FILE = "bot.log"
 LOG_MAX_SIZE = 10 * 1024 * 1024  # 10MB
 LOG_BACKUP_COUNT = 5
 
+
 # ==================== Validation ====================
 
 @dataclass
 class ConfigValidator:
     """Validate configuration on startup"""
-    
+
     @classmethod
     def validate_all(cls):
         """Run all validations"""
@@ -301,14 +307,14 @@ class ConfigValidator:
         cls.validate_risk()
         cls.validate_filters()
         logger.info("✅ All configurations valid")
-    
+
     @classmethod
     def validate_telegram(cls):
         if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "your_bot_token_here":
-            raise ValueError("Invalid TELEGRAM_BOT_TOKEN")
+            raise ValueError("Invalid TELEGRAM_BOT_TOKEN — .env file check করো")
         if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "your_chat_id_here":
-            raise ValueError("Invalid TELEGRAM_CHAT_ID")
-    
+            raise ValueError("Invalid TELEGRAM_CHAT_ID — .env file check করো")
+
     @classmethod
     def validate_exchange(cls):
         if ENV == "production":
@@ -316,7 +322,7 @@ class ConfigValidator:
                 raise ValueError("BINANCE_API_KEY required in production")
             if not BINANCE_SECRET or BINANCE_SECRET == "your_binance_secret":
                 raise ValueError("BINANCE_SECRET required in production")
-    
+
     @classmethod
     def validate_risk(cls):
         if ACCOUNT_SIZE <= 0:
@@ -325,7 +331,7 @@ class ConfigValidator:
             raise ValueError("RISK_PER_TRADE must be between 0 and 5")
         if MAX_LEVERAGE <= 0 or MAX_LEVERAGE > 20:
             raise ValueError("MAX_LEVERAGE must be between 1 and 20")
-    
+
     @classmethod
     def validate_filters(cls):
         if MIN_TIER2_SCORE < 0 or MIN_TIER2_SCORE > 100:
@@ -333,30 +339,41 @@ class ConfigValidator:
         if MIN_SIGNAL_SCORE < 0 or MIN_SIGNAL_SCORE > 100:
             raise ValueError("MIN_SIGNAL_SCORE must be between 0 and 100")
 
+
 # ==================== Profit Calculation ====================
 
 def calculate_indian_profit(entry: float, exit: float, qty: float, side: str) -> Dict[str, float]:
-    """Calculate profit after TDS/GST for Indian exchanges"""
+    """
+    ✅ FIXED: Calculate profit after TDS/GST for Indian exchanges
+    GST = brokerage এর উপর, gross profit এর উপর না
+    """
     if side == "LONG":
         gross_pnl = (exit - entry) * qty
     else:
         gross_pnl = (entry - exit) * qty
-    
+
     if gross_pnl <= 0:
-        return {"net_pnl": gross_pnl, "tds": 0, "gst": 0, "gross": gross_pnl}
-    
+        return {"net_pnl": gross_pnl, "tds": 0, "gst": 0, "brokerage": 0, "gross": gross_pnl}
+
+    # TDS on gross profit
     tds = gross_pnl * (TDS_RATE / 100)
-    gst = gross_pnl * (GST_RATE / 100)  # Simplified, actual calculation differs
-    net_pnl = gross_pnl - tds - gst
-    
+
+    # ✅ FIX: GST শুধু brokerage এর উপর
+    trade_value = entry * qty
+    brokerage = trade_value * (BROKERAGE_RATE / 100)
+    gst = brokerage * (GST_RATE / 100)
+
+    net_pnl = gross_pnl - tds - brokerage - gst
+
     return {
         "gross": round(gross_pnl, 2),
         "tds": round(tds, 2),
+        "brokerage": round(brokerage, 2),
         "gst": round(gst, 2),
         "net_pnl": round(net_pnl, 2)
     }
 
-# Run validation on import
-logger.info("Loading configuration...")
-ConfigValidator.validate_all()
-logger.info("Configuration loaded successfully")
+
+# ✅ FIX: validate_all() এখন import এর সময় চলে না
+# main.py তে explicitly call করা হবে
+logger.info("⚙️ Configuration loaded (validation pending)")
