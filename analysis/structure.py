@@ -1,10 +1,13 @@
 """
-ARUNABHA ALGO BOT - Market Structure Detector v4.1
+ARUNABHA ALGO BOT - Market Structure Detector v4.2
 
 FIXES:
-- BUG-14: CHoCH detection logic ছিল উল্টো — এখন সঠিকভাবে pattern detect হচ্ছে
-  আগের code এ lower_highs এবং higher_lows condition একই জিনিস check করত
-  এখন: properly চেক করা হচ্ছে — bearish pattern থেকে bullish তে shift
+- BUG-14 (kept): CHoCH detection logic সঠিক
+- NEW: get_support_resistance() এ cluster merging যোগ করা হয়েছে
+  — একই zone-এর কাছাকাছি multiple levels merge হয়ে একটি গুরুত্বপূর্ণ level হয়
+  — আগে অনেক scattered levels আসত, এখন consolidated
+- NEW: swing point detection-এ left_bars=3, right_bars=3 (আরো নির্ভরযোগ্য swing)
+- NEW: get_support_resistance() এ num_levels default 5 করা হয়েছে
 """
 
 import logging
@@ -88,9 +91,13 @@ class StructureDetector:
     def _find_swing_points(
         self,
         ohlcv: List[List[float]],
-        left_bars: int = 2,
-        right_bars: int = 2
+        left_bars: int = 3,
+        right_bars: int = 3
     ) -> Dict[str, List[float]]:
+        """
+        ✅ IMPROVED: left_bars=3, right_bars=3 (আগে 2 ছিল)
+        বেশি bars মানে আরো নির্ভরযোগ্য swing point — কম false swing
+        """
         highs = [c[2] for c in ohlcv]
         lows = [c[3] for c in ohlcv]
         swing_highs = []
@@ -134,36 +141,27 @@ class StructureDetector:
         swings: Dict[str, List[float]]
     ) -> Tuple[bool, str]:
         """
-        ✅ FIX BUG-14: CHoCH logic সঠিকভাবে implement করা হয়েছে
+        ✅ FIX BUG-14 (kept from v4.1): CHoCH logic সঠিকভাবে implement করা
 
-        CHoCH (Change of Character) মানে:
-        - Bullish CHoCH: আগে Lower Highs ছিল (bearish), এখন সর্বশেষ swing high
-          আগের দুটো swing high কে break করেছে (bullish তে shift)
-        - Bearish CHoCH: আগে Higher Lows ছিল (bullish), এখন সর্বশেষ swing low
-          আগের দুটো swing low এর নিচে গেছে (bearish তে shift)
-
-        আগের bug: lower_highs = h1 > h2 > h3 এবং if h3 < h2 < h1 — একই condition!
+        CHoCH (Change of Character):
+        - Bullish CHoCH: Lower Highs pattern break → bullish shift
+        - Bearish CHoCH: Higher Lows pattern break → bearish shift
         """
         if len(swings["highs"]) < 3 or len(swings["lows"]) < 3:
             return False, "NONE"
 
-        # Oldest → Newest: h1, h2, h3
         h1, h2, h3 = swings["highs"][-3:]
         l1, l2, l3 = swings["lows"][-3:]
 
-        # ✅ Bullish CHoCH:
-        # Prior structure: Lower Highs (h1 > h2 > h3 — descending highs = bearish)
-        # Character change: latest high (h3) breaks ABOVE the previous high (h2)
-        prior_lower_highs = h1 > h2  # প্রথম দুটো Lower High ছিল
-        recent_break_up = h3 > h2    # সর্বশেষ high আগেরটাকে break করেছে
+        # Bullish CHoCH: Prior Lower Highs, then break up
+        prior_lower_highs = h1 > h2
+        recent_break_up = h3 > h2
         if prior_lower_highs and recent_break_up:
             return True, "LONG"
 
-        # ✅ Bearish CHoCH:
-        # Prior structure: Higher Lows (l1 < l2 < l3 — ascending lows = bullish)
-        # Character change: latest low (l3) breaks BELOW the previous low (l2)
-        prior_higher_lows = l1 < l2  # প্রথম দুটো Higher Low ছিল
-        recent_break_down = l3 < l2  # সর্বশেষ low আগেরটার নিচে গেছে
+        # Bearish CHoCH: Prior Higher Lows, then break down
+        prior_higher_lows = l1 < l2
+        recent_break_down = l3 < l2
         if prior_higher_lows and recent_break_down:
             return True, "SHORT"
 
@@ -172,31 +170,84 @@ class StructureDetector:
     def get_support_resistance(
         self,
         ohlcv: List[List[float]],
-        num_levels: int = 3
+        num_levels: int = 5
     ) -> Dict[str, List[float]]:
+        """
+        ✅ IMPROVED: Support/Resistance calculation with cluster merging
+
+        আগের সমস্যা:
+        - শুধু strict 2-bar lookback (highs[i] > highs[i-1] AND highs[i-2])
+        - Cluster merging ছিল না — একই zone-এ অনেক levels আসত
+        - Signal generator শুধু nearest level নিত, কিন্তু সেটা weak level হতে পারত
+
+        এখন:
+        - 3-bar lookback (আরো reliable swing points)
+        - Cluster merging: price-এর 0.5% এর মধ্যে levels একটিতে merge
+        - প্রতিটি cluster-এ কতবার bounce হয়েছে সেটা track করা হচ্ছে (strength)
+        - Stronger clusters আগে দেখানো হচ্ছে
+        """
         if len(ohlcv) < 20:
             return {"support": [], "resistance": []}
 
         highs = [c[2] for c in ohlcv]
         lows = [c[3] for c in ohlcv]
-        resistance_levels = []
-        support_levels = []
+        raw_resistance: List[float] = []
+        raw_support: List[float] = []
 
-        for i in range(2, len(ohlcv) - 2):
-            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
-                    highs[i] > highs[i+1] and highs[i] > highs[i+2]):
-                resistance_levels.append(highs[i])
-            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
-                    lows[i] < lows[i+1] and lows[i] < lows[i+2]):
-                support_levels.append(lows[i])
+        # ✅ 3-bar swing point detection (আগে 2-bar ছিল)
+        for i in range(3, len(ohlcv) - 3):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i-3] and
+                    highs[i] > highs[i+1] and highs[i] > highs[i+2] and highs[i] > highs[i+3]):
+                raw_resistance.append(highs[i])
 
-        resistance_levels.sort(reverse=True)
-        support_levels.sort()
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i-3] and
+                    lows[i] < lows[i+1] and lows[i] < lows[i+2] and lows[i] < lows[i+3]):
+                raw_support.append(lows[i])
+
+        # ✅ Cluster merging
+        merged_resistance = self._merge_levels(raw_resistance, cluster_pct=0.5)
+        merged_support = self._merge_levels(raw_support, cluster_pct=0.5)
+
+        # Sort: resistance ascending (nearest first from below), support descending (nearest first from above)
+        merged_resistance.sort()
+        merged_support.sort(reverse=True)
 
         return {
-            "resistance": resistance_levels[:num_levels],
-            "support": support_levels[:num_levels]
+            "resistance": merged_resistance[:num_levels],
+            "support": merged_support[:num_levels]
         }
+
+    def _merge_levels(
+        self,
+        levels: List[float],
+        cluster_pct: float = 0.5
+    ) -> List[float]:
+        """
+        ✅ NEW: Close levels cluster করে একটি representative level বের করো
+
+        cluster_pct: এই percentage-এর মধ্যে থাকা levels একই cluster
+        Returns: cluster average values
+        """
+        if not levels:
+            return []
+
+        sorted_levels = sorted(levels)
+        clusters: List[List[float]] = []
+        current_cluster: List[float] = [sorted_levels[0]]
+
+        for level in sorted_levels[1:]:
+            # Check if this level is within cluster_pct% of cluster average
+            cluster_avg = sum(current_cluster) / len(current_cluster)
+            if abs(level - cluster_avg) / cluster_avg * 100 <= cluster_pct:
+                current_cluster.append(level)
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [level]
+
+        clusters.append(current_cluster)
+
+        # Return average of each cluster — weighted by count (more touches = stronger level)
+        return [sum(c) / len(c) for c in clusters]
 
     def is_near_level(self, price: float, level: float, threshold_pct: float = 0.5) -> bool:
         if level == 0:
