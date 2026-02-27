@@ -60,6 +60,20 @@ class MessageFormatter:
         except:
             time_str = datetime.now().strftime("%H:%M IST")
         
+        # Sentiment
+        sentiment_text = ""
+        sentiment_info = signal.get("sentiment")
+        if sentiment_info:
+            fg_val = sentiment_info.get("fear_greed_value", "")
+            fg_label = sentiment_info.get("fear_greed_label", "").replace("_", " ")
+            alt = sentiment_info.get("alt_season_index", "")
+            fg_emoji_map = {
+                "EXTREME FEAR": "😱", "FEAR": "😨", "NEUTRAL": "😐",
+                "GREED": "😄", "EXTREME GREED": "🤑"
+            }
+            fg_em = fg_emoji_map.get(fg_label, "😮")
+            sentiment_text = f"\n{fg_em} <b>Sentiment:</b> {fg_label}: {fg_val} | Alt Season: {alt}"
+
         message = f"""
 {emoji} <b>ARUNABHA SIGNAL</b> {emoji}
 
@@ -74,7 +88,7 @@ class MessageFormatter:
 <b>R:R Ratio:</b> {signal.get('rr_ratio', 0):.2f}{position_text}
 
 <b>Market:</b> {market_emoji} {market_type.upper()}
-<b>Structure:</b> {signal.get('structure_strength', 'UNKNOWN')}
+<b>Structure:</b> {signal.get('structure_strength', 'UNKNOWN')}{sentiment_text}
 {factors_text}{levels_text}
 
 ⏰ {time_str}
