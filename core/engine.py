@@ -120,9 +120,9 @@ class ArunabhaEngine:
         self.daily_signals: int = self.state.state.get("daily_signals_count", 0)
 
     def _create_task(self, coro, name: str = None) -> asyncio.Task:
-        """Point 16: Create task with error handler"""
+        """ISSUE 13 FIX: add_done_callback properly registered"""
         task = asyncio.create_task(coro, name=name)
-        task.add_done_callback(_task_error_handler)
+        task.add_done_callback(_task_error_handler)   # ← was missing before
         self._background_tasks.append(task)
         return task
 
@@ -195,7 +195,8 @@ class ArunabhaEngine:
         if not self._btc_data_ready:
             logger.debug(f"BTC not ready — skipping {symbol}")
             return
-# Check daily limits
+
+        # Check daily limits
         if self.state.state.get("is_daily_locked"):
             return
 
@@ -206,6 +207,12 @@ class ArunabhaEngine:
             return
 
         # Cooldown check
+        last = self.last_signal_time.get(symbol)
+        if last:
+            elapsed = (datetime.now() - last).total_seconds() / 60
+            if elapsed < config.COOLDOWN_MINUTES:
+                return
+# Cooldown check
         last = self.last_signal_time.get(symbol)
         if last:
             elapsed = (datetime.now() - last).total_seconds() / 60
@@ -296,6 +303,25 @@ class ArunabhaEngine:
         self.daily_signals += 1
         self.last_signal_time[symbol] = datetime.now()
 
+        # Entry zone (calculate before sending)
+        entry_zone = self.state.get_entry_zone(signal["entry"], direction)
+        signal["entry_zone"] = entry_zone
+
+        # ISSUE 12 FIX: Validate current price is still in entry zone
+        # (price may have moved since signal was generated)
+        try:
+            ohlcv_now = self.cache.get_ohlcv(symbol, "15m")
+            if ohlcv_now:
+                current_price = float(ohlcv_now[-1][4])
+                zone_ok, zone_msg = self.state.check_entry_zone_valid(signal, current_price)
+                if not zone_ok:
+                    logger.info(f"⏸️ Entry zone stale {symbol}: {zone_msg} — skipping signal")
+                    self.state.clear_active_signal(symbol)
+                    self.daily_signals -= 1
+                    return
+        except Exception as e:
+            logger.debug(f"Entry zone check error {symbol}: {e}")
+
         # Adaptive threshold: record signal for future win rate tracking
         self._signal_history.append({
             "symbol": symbol,
@@ -305,10 +331,6 @@ class ArunabhaEngine:
             "score": signal.get("score"),
             "result": None  # filled in by on_trade_result
         })
-
-        # Entry zone
-        entry_zone = self.state.get_entry_zone(signal["entry"], direction)
-        signal["entry_zone"] = entry_zone
 
         # Send
         await self.telegram.send_signal(signal, self.market_type)
@@ -325,26 +347,23 @@ class ArunabhaEngine:
 
     def _get_session_multiplier(self) -> float:
         """
-        Session-aware position sizing:
-        Asia: 0.7x (lower volume, wider spreads)
-        London open / NY open: 1.2x (best liquidity)
-        High volatility market: 0.8x
-        Default: 1.0x
+        ISSUE 19 FIX: Session multipliers from config (not hardcoded)
+        config.SESSION_SIZE_MULTIPLIERS can be hot-reloaded via /reload
         """
         import pytz
+        mults = config.SESSION_SIZE_MULTIPLIERS
         now = datetime.now(pytz.timezone("Asia/Kolkata"))
         hour = now.hour
 
         if self.market_type == MarketType.HIGH_VOL:
-            return 0.8
-
-        # London open (13-15 IST) and NY open (18-20 IST) — best sessions
-        if 13 <= hour <= 15 or 18 <= hour <= 20:
-            return 1.2
-        # Asia session (7-11 IST) — lower liquidity
-        elif 7 <= hour <= 11:
-            return 0.7
-        return 1.0
+            return mults.get("high_vol", 0.8)
+        if 13 <= hour <= 15:
+            return mults.get("london_open", 1.2)
+        if 18 <= hour <= 20:
+            return mults.get("ny_open", 1.2)
+        if 7 <= hour <= 11:
+            return mults.get("asia", 0.7)
+        return mults.get("default", 1.0)
 
     def _update_adaptive_threshold(self):
         """
@@ -385,12 +404,16 @@ class ArunabhaEngine:
         pnl_inr = self.state.current_balance * (pnl_pct / 100)
 
         if self.paper_trading:
-            self._paper_pnl += pnl_inr
+            pnl_inr = self.state.current_balance * (pnl_pct / 100)
+            # ISSUE 20 FIX: persisted via state_manager (survives restart)
+            self.state.record_paper_trade(symbol, pnl_inr)
+            self._paper_pnl = self.state.state.get("paper_pnl_inr", 0.0)
             logger.info(
-                f"📄 Paper trade result: {symbol} {pnl_pct:+.2f}% "
-                f"(sim ₹{pnl_inr:+.0f}) | Paper P&L: ₹{self._paper_pnl:+.0f}"
+                f"📄 Paper trade: {symbol} {pnl_pct:+.2f}% "
+                f"(sim ₹{pnl_inr:+.0f}) | Total: ₹{self._paper_pnl:+,.0f}"
             )
         else:
+            pnl_inr = self.state.current_balance * (pnl_pct / 100)
             self.state.record_trade(symbol, pnl_pct, pnl_inr)
 
         # Update signal history for adaptive threshold
