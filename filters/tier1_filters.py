@@ -11,6 +11,7 @@ import config
 from core.constants import MarketType, BTCRegime, SessionType
 from analysis.technical import TechnicalAnalyzer
 from analysis.market_regime import BTCRegimeResult
+from analysis.sentiment import SentimentAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class Tier1Filters:
     
     def __init__(self):
         self.analyzer = TechnicalAnalyzer()
+        self.sentiment_analyzer = SentimentAnalyzer()
     
     def evaluate_all(
         self,
@@ -76,12 +78,49 @@ class Tier1Filters:
             "message": session_msg,
             "weight": "MANDATORY"
         }
+
+        # Filter 6: Sentiment (EXTREME FEAR blocks LONG, EXTREME GREED blocks SHORT)
+        sentiment_passed, sentiment_msg = self._check_sentiment(direction, data)
+        results["sentiment"] = {
+            "passed": sentiment_passed,
+            "message": sentiment_msg,
+            "weight": "MANDATORY"
+        }
         
         # Overall result - ALL must pass
         all_passed = all(r["passed"] for r in results.values())
         
         return all_passed, results
     
+    def _check_sentiment(
+        self,
+        direction: Optional[str],
+        data: Dict[str, Any]
+    ) -> Tuple[bool, str]:
+        """
+        Tier1 Sentiment Filter:
+        EXTREME FEAR (F&G ≤ 20) → block LONG
+        EXTREME GREED (F&G ≥ 80) → block SHORT
+        """
+        try:
+            sentiment_data = data.get("sentiment", None)
+            result = self.sentiment_analyzer.analyze(sentiment_data)
+
+            fg = result.fear_greed_value
+            label = result.fear_greed_label.replace("_", " ")
+
+            if direction == "LONG" and self.sentiment_analyzer.is_long_blocked(result):
+                return False, f"🚫 LONG blocked: Extreme Fear ({fg}) — market panic"
+
+            if direction == "SHORT" and self.sentiment_analyzer.is_short_blocked(result):
+                return False, f"🚫 SHORT blocked: Extreme Greed ({fg}) — overheated"
+
+            return True, f"Sentiment OK: {label} ({fg}), AltSeason: {result.alt_season_index}"
+
+        except Exception as e:
+            logger.warning(f"Sentiment filter error: {e} — allowing trade")
+            return True, "Sentiment check skipped (error)"
+
     def _check_btc_regime(
         self,
         btc_regime: BTCRegimeResult,
