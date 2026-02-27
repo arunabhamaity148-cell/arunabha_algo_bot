@@ -1,33 +1,22 @@
 """
 ARUNABHA ALGO BOT - Backtest Engine v4.2
+=========================================
 
-CRITICAL FIX — LOOKAHEAD BIAS:
-    আগের bug:
-        i = current candle index
-        signal entry = ohlcv_list[i][-1][4]  ← candle[i]-এর close
-        execute_trade(ohlcv_list[i:])         ← same candle[i] থেকে check শুরু
-
-        এর মানে: signal দেওয়া হচ্ছে candle[i]-এর close দেখে,
-        কিন্তু TP/SL check হচ্ছে সেই একই candle[i]-এর high/low দিয়ে।
-        Real trading-এ এটা সম্ভব নয় — close দেখার পরে সেই candle-এর
-        high/low আর accessible নয়।
-
-    Fix:
-        execute_trade(ohlcv_list[i+1:])  ← NEXT candle থেকে execution শুরু
-        entry price = next candle-এর open price (realistic)
-
-ADDITIONAL FIXES:
-- Cooldown: একটি signal দেওয়ার পর MIN_COOLDOWN_CANDLES candle skip করো
-- avg_rr সঠিকভাবে calculate হচ্ছে (win/loss ratio, absolute pct নয়)
-- Sharpe ratio annualization factor: candle timeframe অনুযায়ী
+Points implemented:
+Point 9  — Slippage + Commission model (Binance futures: 0.04% taker + 0.05% slippage)
+Point 12 — Expectancy tracking (per trade update)
+Point 13 — Monte Carlo simulation (bootstrap resampling, scipy-free)
+Point 14 — Regime-specific performance tracking (STRONG vs MODERATE structure)
 """
 
 import logging
+import math
+import random
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+from dataclasses import dataclass, field
 
 from analysis.technical import TechnicalAnalyzer
 from analysis.structure import StructureDetector
@@ -35,13 +24,20 @@ from filters.filter_orchestrator import FilterOrchestrator
 
 logger = logging.getLogger(__name__)
 
-# Minimum candles to skip after a signal (cooldown)
-MIN_COOLDOWN_CANDLES = 4   # 15m * 4 = 1 hour cooldown
+# ✅ Point 9: Realistic cost model
+TAKER_FEE_PCT = 0.04      # Binance futures taker fee per side
+SLIPPAGE_PCT = 0.05       # Conservative slippage per side
+ROUND_TRIP_COST = (TAKER_FEE_PCT + SLIPPAGE_PCT) * 2  # 0.18% total
+
+COOLDOWN_CANDLES = 4
+MAX_HOLD_CANDLES = 60
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 3.0
+MIN_RR = 1.5
 
 
 @dataclass
 class BacktestResult:
-    """Backtest results"""
     total_trades: int
     winning_trades: int
     losing_trades: int
@@ -60,12 +56,13 @@ class BacktestResult:
     trades: List[Dict]
     equity_curve: List[float]
     monthly_stats: Dict
+    expectancy: float = 0.0           # Point 12
+    regime_stats: Dict = field(default_factory=dict)  # Point 14
+    total_costs_pct: float = 0.0      # Point 9
 
 
 class BacktestEngine:
-    """
-    Historical backtesting engine — FIXED for production use
-    """
+    """Backtest engine — lookahead bias fixed + realistic costs"""
 
     def __init__(self, initial_capital: float = 100000):
         self.initial_capital = initial_capital
@@ -82,9 +79,6 @@ class BacktestEngine:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> BacktestResult:
-        """
-        Run backtest on historical data
-        """
         if start_date:
             df = df[df.index >= start_date]
         if end_date:
@@ -94,396 +88,349 @@ class BacktestEngine:
             logger.warning("Insufficient data for backtest")
             return self._empty_result()
 
-        logger.info(f"Running backtest on {len(df)} candles from {df.index[0]} to {df.index[-1]}")
+        logger.info(f"Backtest: {symbol} | {len(df)} candles | {df.index[0].date()} → {df.index[-1].date()}")
 
         trades = []
         equity_curve = [self.initial_capital]
         self.capital = self.initial_capital
         self.peak_capital = self.initial_capital
-
         ohlcv_list = self._df_to_ohlcv(df)
+        last_signal_idx = -COOLDOWN_CANDLES
 
-        # ✅ FIX: Track cooldown — skip N candles after a signal
-        last_signal_candle = -MIN_COOLDOWN_CANDLES  # Allow signal from the start
-
-        for i in range(50, len(ohlcv_list) - 1):  # -1 কারণ আমরা i+1 candle access করব
-            # Cooldown check
-            if i - last_signal_candle < MIN_COOLDOWN_CANDLES:
+        for i in range(50, len(ohlcv_list) - 1):
+            if i - last_signal_idx < COOLDOWN_CANDLES:
                 equity_curve.append(self.capital)
                 continue
 
-            # ✅ FIX: Only use data up to and including candle[i] for signal
-            # candle[i] just CLOSED — we can see its close price
-            current_data = ohlcv_list[:i + 1]
-
-            signal = self._generate_backtest_signal(symbol, current_data)
-
+            signal = self._generate_backtest_signal(symbol, ohlcv_list[:i + 1])
             if signal:
-                # ✅ CRITICAL FIX: Execute from candle[i+1] onward
-                # Entry = candle[i+1] open (next candle open = realistic entry)
-                # আগে ছিল: ohlcv_list[i:] — same candle-এ TP/SL check = lookahead bias
-                future_data = ohlcv_list[i + 1:]
-                trade = self._execute_trade(signal, future_data)
-
+                trade = self._execute_trade(signal, ohlcv_list[i + 1:])
                 if trade:
                     trades.append(trade)
-                    self.capital += trade['pnl_usd']
+                    self.capital += trade["pnl_usd"]
                     if self.capital > self.peak_capital:
                         self.peak_capital = self.capital
-                    last_signal_candle = i
+                    last_signal_idx = i
 
             equity_curve.append(self.capital)
 
         result = self._calculate_statistics(trades, equity_curve)
         logger.info(
-            f"Backtest complete: {result.total_trades} trades, "
-            f"{result.win_rate:.1f}% win rate, "
-            f"{result.total_pnl_percent:+.2f}% return"
+            f"Done: {result.total_trades} trades | WR={result.win_rate:.1f}% | "
+            f"PF={result.profit_factor:.2f} | Return={result.total_pnl_percent:+.2f}% | "
+            f"Expectancy={result.expectancy:+.3f}%/trade"
         )
-
         return result
 
-    def _generate_backtest_signal(
-        self,
-        symbol: str,
-        ohlcv: List[List[float]]
-    ) -> Optional[Dict]:
-        """
-        Generate signal for backtest
-
-        NOTE: এটা intentionally simplified version।
-        Live bot-এর full filter system (BTC regime, fear/greed, funding rate etc.)
-        backtest-এ replicate করা হয়নি কারণ historical data সব সময় available নয়।
-        এই backtest শুধু price action logic test করে।
-        """
+    def _generate_backtest_signal(self, symbol: str, ohlcv: List) -> Optional[Dict]:
         if len(ohlcv) < 50:
             return None
-
         structure = self.structure.detect(ohlcv)
-
-        # WEAK structure-এ signal নেই
         if structure.strength == "WEAK":
             return None
-
         atr = self.analyzer.calculate_atr(ohlcv)
         if atr <= 0:
             return None
-
-        # ✅ Signal entry price = last closed candle close
-        # কিন্তু actual execution হবে পরের candle-এর open-এ (execute_trade এ handle করা)
-        signal_price = ohlcv[-1][4]
-        signal_timestamp = ohlcv[-1][0]
-
+        p = ohlcv[-1][4]
+        regime = "STRONG" if structure.choch_detected else "MODERATE"
         if structure.direction == "LONG":
-            return {
-                "direction": "LONG",
-                "entry": signal_price,          # Signal price (reference only)
-                "stop_loss": signal_price - (atr * 1.5),
-                "take_profit": signal_price + (atr * 3.0),
-                "timestamp": signal_timestamp,
-                "atr": atr,
-                "structure_strength": structure.strength
-            }
+            return {"direction": "LONG", "entry": p, "stop_loss": p - atr * ATR_SL_MULT,
+                    "take_profit": p + atr * ATR_TP_MULT, "timestamp": ohlcv[-1][0],
+                    "atr": atr, "structure_strength": structure.strength, "regime": regime}
         else:
-            return {
-                "direction": "SHORT",
-                "entry": signal_price,
-                "stop_loss": signal_price + (atr * 1.5),
-                "take_profit": signal_price - (atr * 3.0),
-                "timestamp": signal_timestamp,
-                "atr": atr,
-                "structure_strength": structure.strength
-            }
+            return {"direction": "SHORT", "entry": p, "stop_loss": p + atr * ATR_SL_MULT,
+                    "take_profit": p - atr * ATR_TP_MULT, "timestamp": ohlcv[-1][0],
+                    "atr": atr, "structure_strength": structure.strength, "regime": regime}
 
-    def _execute_trade(
-        self,
-        signal: Dict,
-        future_data: List[List[float]]
-    ) -> Optional[Dict]:
-        """
-        ✅ FIXED: Execute trade starting from NEXT candle open
-
-        আগের lookahead bias:
-            entry = signal candle-এর close
-            execution check শুরু = same candle-এর high/low ← impossible in reality
-
-        এখন:
-            entry = future_data[0]-এর open (next candle open)
-            SL/TP recalculate করা হচ্ছে new entry থেকে (ATR distance maintain)
-            execution check শুরু = future_data[0] (same candle as entry = realistic)
-        """
+    def _execute_trade(self, signal: Dict, future_data: List) -> Optional[Dict]:
         if len(future_data) < 2:
             return None
 
-        # ✅ Realistic entry = next candle open
-        next_candle_open = float(future_data[0][1])  # index 1 = open price
-        signal_price = signal["entry"]
         atr = signal.get("atr", 0)
         direction = signal["direction"]
+        signal_price = signal["entry"]
 
-        # Recalculate SL/TP from actual entry price
-        if atr > 0:
-            if direction == "LONG":
-                entry = next_candle_open
-                sl = entry - (atr * 1.5)
-                tp = entry + (atr * 3.0)
-            else:
-                entry = next_candle_open
-                sl = entry + (atr * 1.5)
-                tp = entry - (atr * 3.0)
+        # ✅ Point 9: Realistic entry = next candle open + slippage
+        raw_entry = float(future_data[0][1])
+        if direction == "LONG":
+            entry = raw_entry * (1 + SLIPPAGE_PCT / 100)
+            sl = entry - atr * ATR_SL_MULT
+            tp = entry + atr * ATR_TP_MULT
         else:
-            # Fallback: scale SL/TP from signal price to new entry
-            if direction == "LONG":
-                sl_dist = signal_price - signal["stop_loss"]
-                tp_dist = signal["take_profit"] - signal_price
-                entry = next_candle_open
-                sl = entry - sl_dist
-                tp = entry + tp_dist
-            else:
-                sl_dist = signal["stop_loss"] - signal_price
-                tp_dist = signal_price - signal["take_profit"]
-                entry = next_candle_open
-                sl = entry + sl_dist
-                tp = entry - tp_dist
+            entry = raw_entry * (1 - SLIPPAGE_PCT / 100)
+            sl = entry + atr * ATR_SL_MULT
+            tp = entry - atr * ATR_TP_MULT
 
-        # Check each future candle for TP/SL hit
         exit_price = None
-        exit_time = None
+        exit_idx = None
         pnl_pct = None
-        bars_held = 0
 
         for i, candle in enumerate(future_data):
-            high = float(candle[2])
-            low = float(candle[3])
-
+            h, l = float(candle[2]), float(candle[3])
             if direction == "LONG":
-                if high >= tp:
-                    exit_price = tp
-                    exit_time = candle[0]
-                    pnl_pct = (tp - entry) / entry * 100
-                    bars_held = i + 1
-                    break
-                elif low <= sl:
-                    exit_price = sl
-                    exit_time = candle[0]
-                    pnl_pct = (sl - entry) / entry * 100
-                    bars_held = i + 1
-                    break
-            else:  # SHORT
-                if low <= tp:
-                    exit_price = tp
-                    exit_time = candle[0]
-                    pnl_pct = (entry - tp) / entry * 100
-                    bars_held = i + 1
-                    break
-                elif high >= sl:
-                    exit_price = sl
-                    exit_time = candle[0]
-                    pnl_pct = (entry - sl) / entry * 100
-                    bars_held = i + 1
-                    break
-
-        # Max holding: 60 candles (~15 hours on 15m)
-        if exit_price is None:
-            max_hold = min(60, len(future_data) - 1)
-            exit_price = float(future_data[max_hold][4])
-            exit_time = future_data[max_hold][0]
-            bars_held = max_hold
-            if direction == "LONG":
-                pnl_pct = (exit_price - entry) / entry * 100
+                if h >= tp:
+                    # ✅ Exit slippage on TP (you miss slightly)
+                    ep = tp * (1 - SLIPPAGE_PCT / 100)
+                    pnl_pct = (ep - entry) / entry * 100
+                    exit_price, exit_idx = tp, i; break
+                elif l <= sl:
+                    ep = sl * (1 - SLIPPAGE_PCT / 100)
+                    pnl_pct = (ep - entry) / entry * 100
+                    exit_price, exit_idx = sl, i; break
             else:
-                pnl_pct = (entry - exit_price) / entry * 100
+                if l <= tp:
+                    ep = tp * (1 + SLIPPAGE_PCT / 100)
+                    pnl_pct = (entry - ep) / entry * 100
+                    exit_price, exit_idx = tp, i; break
+                elif h >= sl:
+                    ep = sl * (1 + SLIPPAGE_PCT / 100)
+                    pnl_pct = (entry - ep) / entry * 100
+                    exit_price, exit_idx = sl, i; break
 
-        if pnl_pct is None:
+        if exit_price is None:
+            j = min(MAX_HOLD_CANDLES, len(future_data) - 1)
+            exit_price = float(future_data[j][4])
+            exit_idx = j
+            if direction == "LONG":
+                pnl_pct = (exit_price * (1 - SLIPPAGE_PCT/100) - entry) / entry * 100
+            else:
+                pnl_pct = (entry - exit_price * (1 + SLIPPAGE_PCT/100)) / entry * 100
+
+        # ✅ Point 9: Commission round trip
+        pnl_pct -= TAKER_FEE_PCT * 2
+
+        # Position size
+        sl_dist = abs(entry - sl) / entry
+        if sl_dist <= 0:
             return None
-
-        # Position size: 1% risk of current capital
-        risk_pct = 1.0
-        risk_amount = self.capital * (risk_pct / 100)
-        sl_distance_pct = abs(entry - sl) / entry * 100
-        if sl_distance_pct > 0:
-            position_size = risk_amount / (sl_distance_pct / 100)
-        else:
-            position_size = self.capital * 0.01
-
+        position_size = (self.capital * 0.01) / sl_dist
         pnl_usd = position_size * (pnl_pct / 100)
 
         return {
             "entry_time": signal["timestamp"],
-            "exit_time": exit_time,
+            "exit_time": future_data[exit_idx][0] if exit_idx is not None else 0,
             "direction": direction,
-            "signal_price": signal_price,      # Original signal candle close
-            "entry": round(entry, 8),          # Actual entry (next candle open)
+            "signal_price": signal_price,
+            "entry": round(entry, 8),
             "exit": round(exit_price, 8),
             "sl": round(sl, 8),
             "tp": round(tp, 8),
             "pnl_pct": round(pnl_pct, 4),
             "pnl_usd": round(pnl_usd, 2),
-            "bars_held": bars_held,
-            "structure_strength": signal.get("structure_strength", "UNKNOWN")
+            "commission_pct": round(TAKER_FEE_PCT * 2, 4),
+            "bars_held": exit_idx or 0,
+            "structure_strength": signal.get("structure_strength", "UNKNOWN"),
+            "regime": signal.get("regime", "UNKNOWN"),
         }
 
-    def _calculate_statistics(
-        self,
-        trades: List[Dict],
-        equity_curve: List[float]
-    ) -> BacktestResult:
-        """Calculate backtest statistics"""
-
+    def _calculate_statistics(self, trades: List[Dict], equity_curve: List[float]) -> BacktestResult:
         if not trades:
             return self._empty_result()
 
-        total_trades = len(trades)
-        winning_trades = len([t for t in trades if t['pnl_pct'] > 0])
-        losing_trades = len([t for t in trades if t['pnl_pct'] <= 0])
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        total = len(trades)
+        wins = [t for t in trades if t["pnl_pct"] > 0]
+        losses = [t for t in trades if t["pnl_pct"] <= 0]
+        win_rate = len(wins) / total * 100
 
-        total_pnl = sum(t['pnl_usd'] for t in trades)
-        total_pnl_percent = (total_pnl / self.initial_capital) * 100
+        total_pnl = sum(t["pnl_usd"] for t in trades)
+        total_return = (self.capital - self.initial_capital) / self.initial_capital * 100
 
-        # Drawdown
-        max_drawdown = 0.0
-        max_drawdown_percent = 0.0
-        peak = equity_curve[0]
+        peak = equity_curve[0]; max_dd = 0.0; max_dd_pct = 0.0
+        for v in equity_curve:
+            if v > peak: peak = v
+            dd = peak - v; dd_pct = dd / peak * 100 if peak > 0 else 0
+            if dd > max_dd: max_dd = dd; max_dd_pct = dd_pct
 
-        for value in equity_curve:
-            if value > peak:
-                peak = value
-            dd = peak - value
-            dd_percent = (dd / peak) * 100 if peak > 0 else 0
-            if dd > max_drawdown:
-                max_drawdown = dd
-                max_drawdown_percent = dd_percent
+        gp = sum(t["pnl_usd"] for t in wins)
+        gl = abs(sum(t["pnl_usd"] for t in losses))
+        pf = gp / gl if gl > 0 else (gp if gp > 0 else 0.0)
 
-        # Profit factor
-        gross_profit = sum(t['pnl_usd'] for t in trades if t['pnl_usd'] > 0)
-        gross_loss = abs(sum(t['pnl_usd'] for t in trades if t['pnl_usd'] < 0))
-        if gross_loss > 0:
-            profit_factor = gross_profit / gross_loss
-        elif gross_profit > 0:
-            profit_factor = gross_profit
-        else:
-            profit_factor = 0.0
-
-        # Sharpe ratio (annualized for 15m candles: 365*24*4 = 35040 candles/year)
         returns = []
         for i in range(1, len(equity_curve)):
             if equity_curve[i-1] > 0:
                 returns.append((equity_curve[i] - equity_curve[i-1]) / equity_curve[i-1])
-
-        sharpe_ratio = 0.0
+        sharpe = 0.0
         if len(returns) > 1 and np.std(returns) > 0:
-            annualization = np.sqrt(35040)  # 15m candles per year
-            sharpe_ratio = (np.mean(returns) / np.std(returns)) * annualization
+            sharpe = (np.mean(returns) / np.std(returns)) * math.sqrt(35040)
 
-        # ✅ FIXED avg_rr: actual win/loss ratio
-        wins = [t['pnl_pct'] for t in trades if t['pnl_pct'] > 0]
-        losses = [abs(t['pnl_pct']) for t in trades if t['pnl_pct'] < 0]
-        avg_win = float(np.mean(wins)) if wins else 0.0
-        avg_loss = float(np.mean(losses)) if losses else 0.0
-        avg_rr = (avg_win / avg_loss) if avg_loss > 0 else avg_win
+        avg_win = float(np.mean([t["pnl_pct"] for t in wins])) if wins else 0.0
+        avg_loss = float(np.mean([abs(t["pnl_pct"]) for t in losses])) if losses else 0.0
+        avg_rr = avg_win / avg_loss if avg_loss > 0 else avg_win
 
-        best_trade = max(t['pnl_pct'] for t in trades) if trades else 0.0
-        worst_trade = min(t['pnl_pct'] for t in trades) if trades else 0.0
+        # ✅ Point 12: Expectancy
+        wr_d = len(wins) / total
+        expectancy = (wr_d * avg_win) - ((1 - wr_d) * avg_loss)
 
-        monthly_stats = self._calculate_monthly_stats(trades)
+        # ✅ Point 14: Regime stats
+        regime_stats = {}
+        for t in trades:
+            r = t.get("regime", "UNKNOWN")
+            if r not in regime_stats:
+                regime_stats[r] = {"trades": 0, "wins": 0, "pnl": 0.0}
+            regime_stats[r]["trades"] += 1
+            regime_stats[r]["pnl"] += t["pnl_pct"]
+            if t["pnl_pct"] > 0:
+                regime_stats[r]["wins"] += 1
+        for r in regime_stats:
+            n = regime_stats[r]["trades"]
+            regime_stats[r]["win_rate"] = round(regime_stats[r]["wins"] / n * 100, 1) if n > 0 else 0
+            regime_stats[r]["avg_pnl"] = round(regime_stats[r]["pnl"] / n, 3) if n > 0 else 0
 
-        return BacktestResult(
-            total_trades=total_trades,
-            winning_trades=winning_trades,
-            losing_trades=losing_trades,
-            win_rate=win_rate,
-            total_pnl=total_pnl,
-            total_pnl_percent=total_pnl_percent,
-            max_drawdown=max_drawdown,
-            max_drawdown_percent=max_drawdown_percent,
-            profit_factor=profit_factor,
-            sharpe_ratio=sharpe_ratio,
-            avg_rr=avg_rr,
-            avg_win=avg_win,
-            avg_loss=avg_loss,
-            best_trade=best_trade,
-            worst_trade=worst_trade,
-            trades=trades,
-            equity_curve=equity_curve,
-            monthly_stats=monthly_stats
-        )
+        avg_cost = sum(t.get("commission_pct", 0) for t in trades) / total
 
-    def _calculate_monthly_stats(self, trades: List[Dict]) -> Dict:
-        """Calculate monthly statistics"""
-        monthly: Dict[str, Dict] = {}
-
-        for trade in trades:
+        monthly = {}
+        for t in trades:
             try:
-                month = datetime.fromtimestamp(trade['exit_time'] / 1000).strftime('%Y-%m')
+                month = datetime.fromtimestamp(t["exit_time"] / 1000).strftime("%Y-%m")
             except Exception:
                 month = "unknown"
-
             if month not in monthly:
-                monthly[month] = {'trades': 0, 'pnl': 0.0, 'wins': 0}
+                monthly[month] = {"trades": 0, "pnl": 0.0, "wins": 0}
+            monthly[month]["trades"] += 1
+            monthly[month]["pnl"] += t["pnl_usd"]
+            if t["pnl_pct"] > 0:
+                monthly[month]["wins"] += 1
+        for m in monthly:
+            n = monthly[m]["trades"]
+            monthly[m]["win_rate"] = round(monthly[m]["wins"] / n * 100, 1) if n > 0 else 0
 
-            monthly[month]['trades'] += 1
-            monthly[month]['pnl'] += trade['pnl_usd']
-            if trade['pnl_pct'] > 0:
-                monthly[month]['wins'] += 1
+        return BacktestResult(
+            total_trades=total, winning_trades=len(wins), losing_trades=len(losses),
+            win_rate=win_rate, total_pnl=total_pnl, total_pnl_percent=total_return,
+            max_drawdown=max_dd, max_drawdown_percent=max_dd_pct,
+            profit_factor=pf, sharpe_ratio=sharpe, avg_rr=avg_rr,
+            avg_win=avg_win, avg_loss=avg_loss,
+            best_trade=max(t["pnl_pct"] for t in trades),
+            worst_trade=min(t["pnl_pct"] for t in trades),
+            trades=trades, equity_curve=equity_curve, monthly_stats=monthly,
+            expectancy=round(expectancy, 4), regime_stats=regime_stats,
+            total_costs_pct=round(avg_cost, 4),
+        )
 
-        for month in monthly:
-            t = monthly[month]['trades']
-            monthly[month]['win_rate'] = (monthly[month]['wins'] / t * 100) if t > 0 else 0
-
-        return monthly
-
-    def _df_to_ohlcv(self, df: pd.DataFrame) -> List[List[float]]:
-        """Convert DataFrame to OHLCV list format"""
-        ohlcv = []
-        for idx, row in df.iterrows():
-            ohlcv.append([
-                int(idx.timestamp() * 1000),
-                float(row['open']),
-                float(row['high']),
-                float(row['low']),
-                float(row['close']),
-                float(row['volume'])
-            ])
-        return ohlcv
+    def _df_to_ohlcv(self, df: pd.DataFrame) -> List:
+        return [[int(idx.timestamp() * 1000), float(r["open"]), float(r["high"]),
+                 float(r["low"]), float(r["close"]), float(r["volume"])]
+                for idx, r in df.iterrows()]
 
     def _empty_result(self) -> BacktestResult:
-        """Return empty result"""
         return BacktestResult(
-            total_trades=0, winning_trades=0, losing_trades=0,
-            win_rate=0, total_pnl=0, total_pnl_percent=0,
-            max_drawdown=0, max_drawdown_percent=0,
-            profit_factor=0, sharpe_ratio=0,
-            avg_rr=0, avg_win=0, avg_loss=0,
-            best_trade=0, worst_trade=0,
-            trades=[], equity_curve=[self.initial_capital],
-            monthly_stats={}
+            total_trades=0, winning_trades=0, losing_trades=0, win_rate=0,
+            total_pnl=0, total_pnl_percent=0, max_drawdown=0, max_drawdown_percent=0,
+            profit_factor=0, sharpe_ratio=0, avg_rr=0, avg_win=0, avg_loss=0,
+            best_trade=0, worst_trade=0, trades=[], equity_curve=[self.initial_capital],
+            monthly_stats={}, expectancy=0.0, regime_stats={}, total_costs_pct=0.0
         )
 
     def print_summary(self, result: BacktestResult):
-        """Print backtest summary"""
-        print("\n" + "="*60)
-        print("BACKTEST RESULTS (v4.2 — Lookahead Bias Fixed)")
-        print("="*60)
-        print(f"Total Trades:    {result.total_trades}")
-        print(f"Winning Trades:  {result.winning_trades}")
-        print(f"Losing Trades:   {result.losing_trades}")
-        print(f"Win Rate:        {result.win_rate:.2f}%")
-        print(f"\nProfit & Loss:")
-        print(f"  Total P&L:       ${result.total_pnl:,.2f}")
-        print(f"  Total Return:    {result.total_pnl_percent:+.2f}%")
-        print(f"  Profit Factor:   {result.profit_factor:.2f}")
-        print(f"  Sharpe Ratio:    {result.sharpe_ratio:.2f}")
-        print(f"\nRisk Metrics:")
-        print(f"  Max Drawdown:    ${result.max_drawdown:,.2f}")
-        print(f"  Max Drawdown %:  {result.max_drawdown_percent:.2f}%")
-        print(f"  Avg RR (actual): {result.avg_rr:.2f}")
-        print(f"\nTrade Stats:")
-        print(f"  Avg Win:         {result.avg_win:+.2f}%")
-        print(f"  Avg Loss:        -{result.avg_loss:.2f}%")
-        print(f"  Best Trade:      {result.best_trade:+.2f}%")
-        print(f"  Worst Trade:     {result.worst_trade:+.2f}%")
-        print("="*60)
-        print("\n⚠️  NOTE: Backtest uses simplified signal logic.")
-        print("   Live bot has additional filters (BTC regime, fear/greed,")
-        print("   funding rate etc.) which will reduce signal frequency.")
+        print("\n" + "═"*65)
+        print("  BACKTEST RESULTS v4.2 — Costs + Expectancy + Regime Stats")
+        print(f"  Cost model: {TAKER_FEE_PCT*2:.2f}% commission + {SLIPPAGE_PCT*2:.2f}% slippage/round trip")
+        print("═"*65)
+        rows = [
+            ("Total Trades", f"{result.total_trades}"),
+            ("Win Rate", f"{result.win_rate:.1f}%"),
+            ("Total Return", f"{result.total_pnl_percent:+.2f}%"),
+            ("Profit Factor", f"{result.profit_factor:.3f}"),
+            ("Sharpe Ratio", f"{result.sharpe_ratio:.3f}"),
+            ("Expectancy/trade", f"{result.expectancy:+.3f}%"),
+            ("Avg Cost/trade", f"{result.total_costs_pct:.3f}%"),
+            ("Max Drawdown", f"{result.max_drawdown_percent:.2f}%"),
+            ("Avg Win", f"{result.avg_win:+.3f}%"),
+            ("Avg Loss", f"-{result.avg_loss:.3f}%"),
+            ("Avg RR (actual)", f"{result.avg_rr:.2f}"),
+            ("Best Trade", f"{result.best_trade:+.3f}%"),
+            ("Worst Trade", f"{result.worst_trade:+.3f}%"),
+        ]
+        for label, val in rows:
+            print(f"  {label:<30} {val:>30}")
+
+        if result.regime_stats:
+            print(f"\n  REGIME BREAKDOWN:")
+            for regime, s in result.regime_stats.items():
+                print(f"  {regime:<12} trades={s['trades']:>4} | WR={s['win_rate']:>5.1f}% | avg={s['avg_pnl']:>+6.3f}%")
+
+        # Verdict
+        pf = result.profit_factor
+        if pf >= 1.5 and result.win_rate >= 45 and result.expectancy > 0:
+            verdict = "✅ PROMISING — Paper trade করো আগে"
+        elif pf >= 1.2:
+            verdict = "⚠️  MARGINAL — আরো data দরকার"
+        else:
+            verdict = "❌ NO EDGE — Real money দিও না"
+        print(f"\n  VERDICT: {verdict}")
+        print("═"*65)
+
+
+# ══════════════════════════════════════════════════════
+# ✅ Point 13: Monte Carlo Simulation (scipy-free)
+# ══════════════════════════════════════════════════════
+
+class MonteCarloSimulator:
+    """Bootstrap resampling — 1000 random sequences → worst-case drawdown"""
+
+    def simulate(
+        self,
+        trades: List[Dict],
+        num_simulations: int = 1000,
+        confidence_level: float = 0.95
+    ) -> Dict:
+        if len(trades) < 10:
+            return {"error": "Need at least 10 trades for Monte Carlo"}
+
+        returns = [t["pnl_pct"] for t in trades if "pnl_pct" in t]
+        if not returns:
+            return {"error": "No returns found"}
+
+        final_returns = []
+        max_dds = []
+        n = len(returns)
+
+        for _ in range(num_simulations):
+            sample = [random.choice(returns) for _ in range(n)]
+            equity = [1.0]
+            for r in sample:
+                equity.append(equity[-1] * (1 + r / 100))
+            final_returns.append((equity[-1] - 1) * 100)
+
+            peak = equity[0]
+            max_dd = 0.0
+            for v in equity:
+                if v > peak: peak = v
+                dd = (peak - v) / peak * 100 if peak > 0 else 0
+                if dd > max_dd: max_dd = dd
+            max_dds.append(max_dd)
+
+        final_returns.sort()
+        var_idx = int((1 - confidence_level) * num_simulations)
+        var = final_returns[var_idx]
+        cvar_vals = [r for r in final_returns if r <= var]
+        cvar = sum(cvar_vals) / len(cvar_vals) if cvar_vals else var
+
+        return {
+            "num_simulations": num_simulations,
+            "mean_return": round(sum(final_returns) / len(final_returns), 2),
+            "median_return": round(final_returns[len(final_returns)//2], 2),
+            "var_95": round(var, 2),
+            "cvar_95": round(cvar, 2),
+            "prob_profit": round(sum(1 for r in final_returns if r > 0) / num_simulations * 100, 1),
+            "worst_case": round(min(final_returns), 2),
+            "best_case": round(max(final_returns), 2),
+            "mean_max_drawdown": round(sum(max_dds) / len(max_dds), 2),
+            "dd_95th_pct": round(sorted(max_dds)[int(0.95 * len(max_dds))], 2),
+        }
+
+    def print_summary(self, results: Dict):
+        if "error" in results:
+            print(f"Monte Carlo error: {results['error']}")
+            return
+        print("\n" + "═"*50)
+        print("  MONTE CARLO RESULTS (1000 simulations)")
+        print("═"*50)
+        print(f"  Mean Return:           {results['mean_return']:>+9.2f}%")
+        print(f"  VaR (95%):             {results['var_95']:>+9.2f}%")
+        print(f"  CVaR (worst 5%):       {results['cvar_95']:>+9.2f}%")
+        print(f"  Prob Profit:           {results['prob_profit']:>8.1f}%")
+        print(f"  Mean Max Drawdown:     {results['mean_max_drawdown']:>8.2f}%")
+        print(f"  95th DD percentile:    {results['dd_95th_pct']:>8.2f}%")
+        print(f"  Worst case:            {results['worst_case']:>+9.2f}%")
+        print("═"*50)
