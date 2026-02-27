@@ -195,8 +195,7 @@ class ArunabhaEngine:
         if not self._btc_data_ready:
             logger.debug(f"BTC not ready — skipping {symbol}")
             return
-
-        # Check daily limits
+# Check daily limits
         if self.state.state.get("is_daily_locked"):
             return
 
@@ -533,4 +532,6 @@ class ArunabhaEngine:
                 "fear_index": 50,
                 "sentiment": sentiment_data,   # ← passed to Tier1/Tier2 sentiment
             }
-  
+        except Exception as e:
+            logger.warning(f"Data packet build failed {symbol}: {e}")
+            return None
