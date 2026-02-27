@@ -134,7 +134,41 @@ class BacktestRunner:
             logger.warning(f"⚠️ Report generation failed: {e}")
             files = {}
 
-        # Step 6: Print summary
+        # Step 6: Walk-forward validation (mandatory — overfitting check)
+        wf_summary = {}
+        if len(df) >= 200:
+            logger.info("📊 Running walk-forward validation...")
+            try:
+                from backtest.walk_forward import WalkForwardAnalyzer
+                wf = WalkForwardAnalyzer(self.engine)
+                wf_result = wf.analyze(df, symbol=symbol)
+                wf_summary = {
+                    "windows": wf_result.get("total_windows", 0),
+                    "avg_train_win_rate": round(wf_result.get("avg_train_win_rate", 0), 2),
+                    "avg_test_win_rate": round(wf_result.get("avg_test_win_rate", 0), 2),
+                    "robustness_score": round(wf_result.get("robustness_score", 0), 2),
+                    "verdict": wf_result.get("verdict", "UNKNOWN"),
+                    "recommendation": wf_result.get("recommendation", ""),
+                }
+                logger.info(
+                    f"📊 Walk-forward: {wf_summary['windows']} windows | "
+                    f"Train={wf_summary['avg_train_win_rate']:.1f}% | "
+                    f"Test={wf_summary['avg_test_win_rate']:.1f}% | "
+                    f"Robustness={wf_summary['robustness_score']:.2f} | "
+                    f"Verdict={wf_summary['verdict']}"
+                )
+                if wf_summary["verdict"] == "OVERFIT":
+                    logger.warning(
+                        f"⚠️ OVERFITTING DETECTED: Train {wf_summary['avg_train_win_rate']:.1f}% "
+                        f"vs Test {wf_summary['avg_test_win_rate']:.1f}%"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Walk-forward failed: {e}")
+        else:
+            wf_summary = {"verdict": "SKIPPED", "reason": "Insufficient data (<200 candles)"}
+            logger.warning("⚠️ Walk-forward skipped: insufficient data")
+
+        # Step 7: Print summary
         self.engine.print_summary(result)
 
         return {
@@ -154,6 +188,7 @@ class BacktestRunner:
                 "best_trade_pct": round(result.best_trade, 2),
                 "worst_trade_pct": round(result.worst_trade, 2),
             },
+            "walk_forward": wf_summary,
             "report_files": files
         }
 
