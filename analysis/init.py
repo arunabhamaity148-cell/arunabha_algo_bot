@@ -10,6 +10,7 @@ from .volume_profile import VolumeProfileAnalyzer
 from .liquidity import LiquidityDetector
 from .divergence import DivergenceDetector
 from .correlation import CorrelationAnalyzer
+from .sentiment import SentimentAnalyzer
 
 __all__ = [
     "MarketRegimeDetector",
@@ -18,5 +19,6 @@ __all__ = [
     "VolumeProfileAnalyzer",
     "LiquidityDetector",
     "DivergenceDetector",
-    "CorrelationAnalyzer"
+    "CorrelationAnalyzer",
+    "SentimentAnalyzer",
 ]
