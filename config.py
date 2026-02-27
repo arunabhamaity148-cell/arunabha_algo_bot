@@ -120,7 +120,9 @@ TIER2_FILTERS = {
     "ema_stack": 10,
     "atr_percent": 10,
     "vwap_position": 5,
-    "support_resistance": 5
+    "support_resistance": 5,
+    "volume_on_structure": 10,
+    "sentiment": 15,              # ← NEW: sentiment score
 }
 
 TIER3_FILTERS = [
@@ -269,6 +271,17 @@ USE_REDIS = REDIS_URL is not None
 
 WEBHOOK_PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default-secret-change-this")
+
+# ==================== Paper Trading ====================
+
+PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() == "true"
+
+# ==================== Adaptive Thresholds ====================
+
+ADAPTIVE_THRESHOLD_ENABLED = True
+ADAPTIVE_WINDOW = 20         # last N signals for win rate calc
+ADAPTIVE_MIN_THRESHOLD = 50  # never drop below
+ADAPTIVE_MAX_THRESHOLD = 80  # never go above
 
 # ==================== Profit Target ====================
 
