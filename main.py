@@ -113,8 +113,38 @@ async def debug_status():
         "btc_4h_candles": len(engine.btc_cache.get("4h", [])),
         "market_type": str(engine.market_type),
         "daily_signals": engine.daily_signals,
+        "paper_trading": engine.paper_trading,
+        "paper_pnl": engine._paper_pnl if engine.paper_trading else None,
+        "adaptive_threshold": engine._adaptive_threshold,
+        "ws_status": engine.ws_manager.get_status(),
         "last_signal_time": {k: v.isoformat() for k, v in engine.last_signal_time.items()}
     }
+
+
+@app.post("/reload")
+async def hot_reload_config():
+    """
+    Hot reload config without restarting bot.
+    POST /reload → reloads config.py values at runtime.
+    """
+    try:
+        import importlib
+        import config as cfg_module
+        importlib.reload(cfg_module)
+        logger.info("🔄 Config hot-reloaded")
+        return {
+            "status": "reloaded",
+            "timestamp": datetime.now().isoformat(),
+            "key_values": {
+                "RISK_PER_TRADE": cfg_module.RISK_PER_TRADE,
+                "MAX_SIGNALS_PER_DAY": cfg_module.MAX_SIGNALS_PER_DAY,
+                "MIN_TIER2_SCORE": cfg_module.MIN_TIER2_SCORE,
+                "PAPER_TRADING": cfg_module.PAPER_TRADING,
+            }
+        }
+    except Exception as e:
+        logger.error(f"Config reload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/webhook/{secret}")
