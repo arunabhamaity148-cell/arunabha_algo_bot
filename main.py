@@ -253,6 +253,21 @@ async def startup_event():
         logger.info("🚀 Starting Engine...")
         await engine.start()
 
+        # ISSUE 8 FIX: API permission validation (non-blocking)
+        try:
+            perm_result = await ConfigValidator.validate_api_permissions(engine.rest_client)
+            if not perm_result["ok"]:
+                for err in perm_result.get("errors", []):
+                    logger.error(f"⚠️ API Permission: {err}")
+                await telegram.send_message(
+                    "⚠️ <b>API Permission Warning</b>\n" +
+                    "\n".join(perm_result.get("errors", []))
+                )
+            else:
+                logger.info("✅ API permissions validated")
+        except Exception as e:
+            logger.warning(f"Permission check failed (non-fatal): {e}")
+
         # Scheduler in background
         asyncio.create_task(scheduler.start())
 
