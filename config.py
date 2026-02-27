@@ -308,6 +308,18 @@ LOG_BACKUP_COUNT = 5
 
 # ==================== Validation ====================
 
+# ==================== Session Sizing Multipliers (ISSUE 19 FIX) ====================
+# Moved from engine.py hardcoded values → config (hot-reloadable)
+
+SESSION_SIZE_MULTIPLIERS = {
+    "london_open":  float(os.getenv("SIZE_MULT_LONDON", "1.2")),   # 13-15 IST
+    "ny_open":      float(os.getenv("SIZE_MULT_NY", "1.2")),       # 18-20 IST
+    "asia":         float(os.getenv("SIZE_MULT_ASIA", "0.7")),     # 07-11 IST
+    "high_vol":     float(os.getenv("SIZE_MULT_HIGH_VOL", "0.8")), # MarketType.HIGH_VOL
+    "default":      1.0,
+}
+
+
 @dataclass
 class ConfigValidator:
     """Validate configuration on startup"""
@@ -335,6 +347,59 @@ class ConfigValidator:
                 raise ValueError("BINANCE_API_KEY required in production")
             if not BINANCE_SECRET or BINANCE_SECRET == "your_binance_secret":
                 raise ValueError("BINANCE_SECRET required in production")
+
+    @classmethod
+    async def validate_api_permissions(cls, rest_client) -> Dict[str, Any]:
+        """
+        ISSUE 8 FIX: Validate actual Binance API permissions at startup.
+        Checks: futures trading, read permission, prevents withdrawal key usage.
+
+        Returns: {"ok": bool, "permissions": list, "warnings": list}
+        """
+        result = {"ok": True, "permissions": [], "warnings": [], "errors": []}
+
+        if ENV != "production":
+            result["warnings"].append("Skipping permission check (non-production)")
+            return result
+
+        if not BINANCE_API_KEY:
+            result["warnings"].append("No API key — skipping permission check")
+            return result
+
+        try:
+            # Binance futures /fapi/v1/account endpoint tells us permissions
+            perms = await rest_client.get_api_permissions()
+            result["permissions"] = perms
+
+            # Must have futures trading enabled
+            if "enableFutures" in perms and not perms.get("enableFutures"):
+                result["errors"].append("❌ Futures trading NOT enabled on this API key")
+                result["ok"] = False
+
+            # Withdrawal permission = dangerous key, warn loudly
+            if perms.get("enableWithdrawals"):
+                result["errors"].append(
+                    "🚨 DANGER: API key has WITHDRAWAL permission — "
+                    "use a read+trade only key!"
+                )
+                result["ok"] = False
+
+            # Read is always required
+            if not perms.get("enableReading", True):
+                result["errors"].append("❌ Read permission missing on API key")
+                result["ok"] = False
+
+            if result["ok"]:
+                logger.info(f"✅ API permissions valid: {list(perms.keys())}")
+            else:
+                for err in result["errors"]:
+                    logger.error(err)
+
+        except Exception as e:
+            result["warnings"].append(f"Permission check failed: {e} — continuing")
+            logger.warning(f"API permission check skipped: {e}")
+
+        return result
 
     @classmethod
     def validate_risk(cls):
