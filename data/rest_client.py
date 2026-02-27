@@ -330,3 +330,48 @@ class RESTClient:
         
         logger.info(f"📊 Fetched {len(all_candles)} candles for {symbol} {timeframe}")
         return all_candles
+    async def get_api_permissions(self) -> dict:
+        """
+        ISSUE 8 FIX: Fetch API key permissions from Binance.
+        Uses /sapi/v1/account/apiRestrictions (spot/margin/futures info).
+        Returns dict of permission flags.
+        """
+        try:
+            import hashlib, hmac, time as t
+            import aiohttp as ah
+
+            api_key = config.BINANCE_API_KEY
+            secret = config.BINANCE_SECRET
+
+            if not api_key or not secret:
+                return {"enableReading": True, "note": "no_key"}
+
+            ts = int(t.time() * 1000)
+            params = f"timestamp={ts}"
+            sig = hmac.new(
+                secret.encode(), params.encode(), hashlib.sha256
+            ).hexdigest()
+            url = f"https://api.binance.com/sapi/v1/account/apiRestrictions?{params}&signature={sig}"
+
+            async with ah.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers={"X-MBX-APIKEY": api_key},
+                    timeout=ah.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return {
+                            "enableReading":     data.get("enableReading", True),
+                            "enableFutures":     data.get("enableFutures", False),
+                            "enableSpotAndMarginTrading": data.get("enableSpotAndMarginTrading", False),
+                            "enableWithdrawals": data.get("enableWithdrawals", False),
+                            "enableInternalTransfer": data.get("enableInternalTransfer", False),
+                            "ipRestrict":        data.get("ipRestrict", False),
+                            "raw":               data,
+                        }
+                    else:
+                        return {"error": f"HTTP {resp.status}", "enableReading": True}
+        except Exception as e:
+            logger.warning(f"API permissions fetch failed: {e}")
+            return {"error": str(e), "enableReading": True}
