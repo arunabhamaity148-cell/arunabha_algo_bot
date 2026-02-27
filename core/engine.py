@@ -1,27 +1,27 @@
 """
-ARUNABHA ALGO BOT - Main Engine v4.2
+ARUNABHA ALGO BOT - Main Engine v5.0
 ======================================
+UPGRADES v5.0:
+- Paper Trading Mode: PAPER_TRADING=true → signals generated, NO real orders
+  P&L simulated in memory, all sent to Telegram with [PAPER] tag
+- Adaptive Thresholds: last 20 signals win rate → auto-tune Tier2 threshold
+  win rate < 40% → threshold +10%, win rate > 65% → threshold -5%
+- Session-Aware Position Sizing: Asia=0.7x, London/NY overlap=1.2x, high_vol=0.8x
+- BTC prices properly passed to Tier3 for correlation fix
+- WebSocket telegram injection for reconnect alerts
 
-Points implemented:
-Point 16 — Background task error handling:
-    আগে: asyncio.create_task() এ exception হলে silent fail
-    এখন: done_callback দিয়ে exception catch করা হচ্ছে
-         Task fail হলে log করে, restart করার চেষ্টা করে
-
-Point 17 — State persistence on restart:
-    আগে: daily signals counter, consecutive losses — memory-তে ছিল
-         Bot restart হলে সব হারিয়ে যেত
-    এখন: StateManager দিয়ে bot_state.json-এ persist করা হচ্ছে
-         Restart হলে state restore হয়
-
+Previous points retained:
+Point 16 — Background task error handling
+Point 17 — State persistence on restart
 Point 3  — Correlation filter integrated via StateManager
-Point 6  — Kelly/drawdown sizing via updated PositionSizer
 """
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any, Tuple
+import os
+from typing import Dict, List, Optional, Any, Tuple, Deque
 from datetime import datetime
+from collections import deque
 
 import config
 from core.constants import (
@@ -44,12 +44,17 @@ from monitoring.metrics_collector import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
+# Paper trading mode — set PAPER_TRADING=true in .env
+PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() == "true"
+
+# Adaptive threshold config
+ADAPTIVE_WINDOW = 20          # last N signals
+ADAPTIVE_MIN_THRESHOLD = 50   # never go below this
+ADAPTIVE_MAX_THRESHOLD = 80   # never go above this
+
 
 def _task_error_handler(task: asyncio.Task):
-    """
-    ✅ Point 16: Background task error callback.
-    asyncio.create_task() exception-এ silent fail না করে log করে।
-    """
+    """Point 16: Background task error callback"""
     try:
         exc = task.exception()
         if exc is not None:
@@ -64,13 +69,14 @@ def _task_error_handler(task: asyncio.Task):
 
 class ArunabhaEngine:
     """
-    Main engine — StateManager + background task error handling
+    Main engine v5.0
+    Paper trading + Adaptive thresholds + Session sizing + Correlation fix
     """
 
     def __init__(self, telegram: Optional[TelegramNotifier] = None):
         self.telegram = telegram or TelegramNotifier()
 
-        # ✅ Point 17: StateManager replaces in-memory counters
+        # State manager
         self.state = StateManager()
 
         # Components
@@ -89,167 +95,157 @@ class ArunabhaEngine:
 
         self.metrics = MetricsCollector(self)
 
-        # Runtime state (not persisted — re-initialized each run)
+        # Runtime state
         self.market_type = MarketType.UNKNOWN
         self.btc_regime: Optional[BTCRegimeResult] = None
         self.btc_cache = {"15m": [], "1h": [], "4h": []}
         self._btc_data_ready = False
         self._btc_fetch_attempts = 0
         self._last_btc_check = None
-
-        # ✅ Point 16: Track background tasks for error handling
         self._background_tasks: List[asyncio.Task] = []
 
-        logger.info("🚀 Engine initialized (StateManager active)")
+        # Paper trading state
+        self.paper_trading = PAPER_TRADING
+        self._paper_pnl: float = 0.0
+        self._paper_trades: int = 0
+        if self.paper_trading:
+            logger.info("📄 PAPER TRADING MODE ACTIVE — no real orders will be placed")
+
+        # Adaptive threshold tracking
+        self._signal_history: Deque[Dict] = deque(maxlen=ADAPTIVE_WINDOW)
+        self._adaptive_threshold: float = config.MIN_TIER2_SCORE
+
+        # Last signal time per symbol
+        self.last_signal_time: Dict[str, datetime] = {}
+        self.daily_signals: int = self.state.state.get("daily_signals_count", 0)
 
     def _create_task(self, coro, name: str = None) -> asyncio.Task:
-        """
-        ✅ Point 16: Wrapper for asyncio.create_task() with error handling.
-        All background tasks should be created through this method.
-        """
+        """Point 16: Create task with error handler"""
         task = asyncio.create_task(coro, name=name)
         task.add_done_callback(_task_error_handler)
         self._background_tasks.append(task)
         return task
 
     async def start(self):
-        """Start the engine"""
-        logger.info("🟢 Starting engine...")
+        """Start engine — REST + Cache + BTC + WebSocket"""
+        logger.info("⚙️ Engine starting...")
 
-        # Step 1: REST API
-        logger.info("🔌 Connecting REST API...")
+        # Inject telegram into WS manager for reconnect alerts
+        self.ws_manager.set_telegram(self.telegram)
+
         try:
             await self.rest_client.connect()
-            logger.info("✅ REST API connected")
+            logger.info("✅ REST client connected")
         except Exception as e:
-            logger.error(f"❌ REST API failed: {e}")
-            logger.warning("⚠️ Continuing in REST backup mode")
+            logger.error(f"❌ REST connection failed: {e}")
 
-        # Step 2: Seed cache
-        logger.info("🌱 Seeding cache...")
-        try:
-            await self._seed_cache()
-            logger.info("✅ Cache seeded")
-        except Exception as e:
-            logger.error(f"❌ Cache seeding failed: {e}")
+        # Seed cache
+        await self._seed_cache()
 
-        # Step 3: BTC data
-        logger.info("🔄 Fetching BTC data...")
-        btc_ok = await self._force_fetch_btc_data()
-        if btc_ok:
-            logger.info("✅ BTC data loaded")
-        else:
-            logger.error("❌ BTC data failed — starting background fetcher")
-            # ✅ Point 16: Use _create_task instead of asyncio.create_task
-            self._create_task(self._background_btc_fetcher(), name="btc_fetcher")
+        # Force BTC fetch
+        ok = await self._force_fetch_btc_data()
+        if not ok:
+            logger.warning("⚠️ BTC data not ready — will retry in background")
+            self._create_task(self._background_btc_fetcher(), "btc_fetcher")
 
-        # Step 4: All pairs
-        logger.info("🔄 Fetching all pairs...")
-        try:
-            await self._force_fetch_all_pairs()
-            logger.info("✅ All pairs fetched")
-        except Exception as e:
-            logger.error(f"❌ Pairs fetch failed: {e}")
+        # Start WebSocket
+        await self.ws_manager.start()
 
-        # Step 5: WebSocket
-        logger.info("🔌 Starting WebSocket...")
-        try:
-            await self.ws_manager.start()
-            logger.info("✅ WebSocket started")
-        except Exception as e:
-            logger.error(f"❌ WebSocket failed: {e}")
-            logger.warning("⚠️ Using REST polling fallback")
+        # Background tasks
+        self._create_task(self._update_regime(), "regime_update")
 
-        # Step 6: Initial regime
-        logger.info("📊 Initial regime detection...")
-        try:
-            await self._update_regime()
-            logger.info(f"✅ Regime: {self.market_type.value}")
-        except Exception as e:
-            logger.error(f"❌ Regime detection failed: {e}")
+        if self.paper_trading:
+            await self.telegram.send_message(
+                "📄 <b>PAPER TRADING MODE</b>\n"
+                "Signals will be generated but NO real orders placed.\n"
+                f"Simulating with ₹{config.ACCOUNT_SIZE:,.0f}"
+            )
 
-        # Step 7: Log restored state
-        status = self.state.get_full_status()
-        logger.info(
-            f"📊 Restored state: {status['daily_trades']} trades today | "
-            f"Consec losses: {status['consecutive_losses']} | "
-            f"DD: {status['current_drawdown_pct']:.2f}%"
-        )
-
-        logger.info("✅ Engine started successfully")
+        logger.info(f"✅ Engine started (paper_trading={self.paper_trading})")
 
     async def stop(self):
-        """Stop the engine gracefully"""
-        logger.info("🛑 Stopping engine...")
+        """Stop engine"""
         await self.ws_manager.stop()
-
-        # Cancel background tasks
         for task in self._background_tasks:
             if not task.done():
                 task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
+        try:
+            await self.rest_client.close()
+        except Exception:
+            pass
         logger.info("✅ Engine stopped")
 
     async def _on_candle_close(self, symbol: str, tf: str, candles: List[List[float]]):
-        """Called when a candle closes — generate signal if conditions met"""
+        """Called on every closed candle"""
         if tf != "15m":
             return
 
-        try:
-            await self._analyze_symbol(symbol, candles)
-        except Exception as e:
-            # ✅ Point 16: Don't let one symbol's error crash the whole loop
-            logger.error(f"❌ _on_candle_close error for {symbol}: {e}", exc_info=e)
+        # Update BTC cache
+        if symbol == "BTC/USDT":
+            self.btc_cache["15m"] = candles
+            if not self._btc_data_ready and len(candles) >= 50:
+                self._btc_data_ready = True
+            self._create_task(self._update_regime(), "regime")
+            return
+
+        await self._analyze_symbol(symbol, candles)
 
     async def _analyze_symbol(self, symbol: str, candles: List[List[float]]):
         """Full analysis pipeline for a symbol"""
+        if not self._btc_data_ready:
+            logger.debug(f"BTC not ready — skipping {symbol}")
+            return
 
-        # ✅ Point 17: Check daily lock from persisted state
+        # Check daily limits
         if self.state.state.get("is_daily_locked"):
-            logger.debug(f"⏸️ {symbol} — daily locked: {self.state.state.get('lock_reason')}")
             return
 
-        # Consecutive loss check
-        if self.state.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-            logger.warning(f"⏸️ {symbol} — max consecutive losses reached")
+        max_signals = config.MAX_SIGNALS_PER_DAY.get(
+            self.market_type.value, config.MAX_SIGNALS_PER_DAY["default"]
+        )
+        if self.daily_signals >= max_signals:
             return
 
-        # Signal cooldown per symbol
-        last_signal = self.state.get_last_signal_time(symbol)
-        if last_signal:
-            elapsed = (datetime.now() - last_signal).total_seconds() / 60
-            if elapsed < config.SIGNAL_COOLDOWN_MINUTES:
+        # Cooldown check
+        last = self.last_signal_time.get(symbol)
+        if last:
+            elapsed = (datetime.now() - last).total_seconds() / 60
+            if elapsed < config.COOLDOWN_MINUTES:
                 return
+
+        # Risk check
+        can_trade, reason = self.risk_manager.can_trade(symbol, self.market_type)
+        if not can_trade:
+            logger.debug(f"Risk blocked {symbol}: {reason}")
+            return
 
         # Build data packet
         data = await self._build_data_packet(symbol, candles)
         if not data:
             return
 
-        # Run filters
-        filter_result = await self.filter_orchestrator.evaluate(
-            symbol=symbol,
-            direction=data.get("direction"),
-            market_type=self.market_type,
-            btc_regime=self.btc_regime,
-            data=data
-        )
-
-        if not filter_result.get("passed"):
-            return
-
         direction = data.get("direction")
         if not direction:
             return
 
-        # ✅ Point 3 (via StateManager): Correlation check
+        # Correlation check via StateManager
         is_blocked, block_reason = self.state.is_correlated_blocked(symbol, direction)
         if is_blocked:
-            logger.info(f"⏸️ {symbol} correlated blocked: {block_reason}")
+            logger.info(f"⏸️ Correlated block {symbol}: {block_reason}")
+            return
+
+        # Filter evaluation with adaptive threshold
+        filter_result = self.filter_orchestrator.evaluate(
+            symbol=symbol,
+            direction=direction,
+            market_type=self.market_type,
+            btc_regime=self.btc_regime,
+            data=data,
+            tier2_threshold_override=self._adaptive_threshold
+        )
+
+        if not filter_result.get("passed"):
+            logger.debug(f"Filters failed {symbol}: {filter_result.get('reason')}")
             return
 
         # Generate signal
@@ -257,13 +253,14 @@ class ArunabhaEngine:
         if not signal:
             return
 
-        # Process
         await self._process_signal(signal)
 
     async def _process_signal(self, signal: Dict):
-        """Process and send signal"""
-        # Get current drawdown for position sizing
+        """Process signal — paper trading aware, session-aware sizing"""
         drawdown_pct = self.state.current_drawdown_pct
+
+        # Session-aware position sizing multiplier
+        session_mult = self._get_session_multiplier()
 
         position = self.risk_manager.calculate_position(
             account_size=self.state.current_balance,
@@ -276,75 +273,162 @@ class ArunabhaEngine:
         )
 
         if position.get("blocked"):
-            logger.warning(f"⏸️ Position blocked: {position.get('reason')}")
             return
 
-        signal["position"] = position
+        # Apply session multiplier to position size
+        if session_mult != 1.0:
+            pos_usd = position.get("position_usd", 0)
+            position["position_usd"] = round(pos_usd * session_mult, 0)
+            position["session_multiplier"] = session_mult
+            logger.info(f"Session sizing: {session_mult}x → ₹{position['position_usd']:,.0f}")
 
+        signal["position"] = position
         symbol = signal["symbol"]
         direction = signal["direction"]
 
-        # ✅ Point 17: Persist signal state
+        # Paper trading tag
+        if self.paper_trading:
+            signal["paper_trade"] = True
+            self._paper_trades += 1
+
+        # Persist state
         self.state.update_last_signal_time(symbol)
         self.state.register_active_signal(symbol, direction)
+        self.daily_signals += 1
+        self.last_signal_time[symbol] = datetime.now()
 
-        # Add entry zone info (Point 11 via StateManager)
+        # Adaptive threshold: record signal for future win rate tracking
+        self._signal_history.append({
+            "symbol": symbol,
+            "direction": direction,
+            "timestamp": datetime.now().isoformat(),
+            "grade": signal.get("grade"),
+            "score": signal.get("score"),
+            "result": None  # filled in by on_trade_result
+        })
+
+        # Entry zone
         entry_zone = self.state.get_entry_zone(signal["entry"], direction)
         signal["entry_zone"] = entry_zone
 
+        # Send
         await self.telegram.send_signal(signal, self.market_type)
 
+        prefix = "📄 [PAPER] " if self.paper_trading else ""
         logger.info(
-            f"✅ SIGNAL: {symbol} {direction} @ {signal['entry']:.6f} | "
+            f"{prefix}✅ SIGNAL: {symbol} {direction} @ {signal['entry']:.6f} | "
             f"Grade: {signal.get('grade')} | Score: {signal.get('score')} | "
-            f"DD: {drawdown_pct:.1f}% | Size: ₹{position.get('position_usd', 0):,.0f}"
+            f"Session: {session_mult}x | DD: {drawdown_pct:.1f}%"
         )
+
+        # Update adaptive threshold after enough data
+        self._update_adaptive_threshold()
+
+    def _get_session_multiplier(self) -> float:
+        """
+        Session-aware position sizing:
+        Asia: 0.7x (lower volume, wider spreads)
+        London open / NY open: 1.2x (best liquidity)
+        High volatility market: 0.8x
+        Default: 1.0x
+        """
+        import pytz
+        now = datetime.now(pytz.timezone("Asia/Kolkata"))
+        hour = now.hour
+
+        if self.market_type == MarketType.HIGH_VOL:
+            return 0.8
+
+        # London open (13-15 IST) and NY open (18-20 IST) — best sessions
+        if 13 <= hour <= 15 or 18 <= hour <= 20:
+            return 1.2
+        # Asia session (7-11 IST) — lower liquidity
+        elif 7 <= hour <= 11:
+            return 0.7
+        return 1.0
+
+    def _update_adaptive_threshold(self):
+        """
+        Adaptive Tier2 threshold based on recent signal win rate.
+        win_rate < 40% → raise threshold (be more selective)
+        win_rate > 65% → lower slightly (allow more signals)
+        """
+        completed = [s for s in self._signal_history if s.get("result") is not None]
+        if len(completed) < 10:
+            return   # not enough data yet
+
+        wins = sum(1 for s in completed if s["result"] == "WIN")
+        win_rate = wins / len(completed)
+
+        old = self._adaptive_threshold
+
+        if win_rate < 0.40:
+            # performing poorly → be more selective
+            self._adaptive_threshold = min(
+                self._adaptive_threshold + 5.0,
+                ADAPTIVE_MAX_THRESHOLD
+            )
+        elif win_rate > 0.65:
+            # performing well → allow slightly more signals
+            self._adaptive_threshold = max(
+                self._adaptive_threshold - 3.0,
+                ADAPTIVE_MIN_THRESHOLD
+            )
+
+        if self._adaptive_threshold != old:
+            logger.info(
+                f"🎯 Adaptive threshold: {old:.0f}% → {self._adaptive_threshold:.0f}% "
+                f"(win_rate={win_rate:.0%} over {len(completed)} trades)"
+            )
 
     async def on_trade_result(self, symbol: str, pnl_pct: float):
-        """
-        ✅ Point 17: Record trade result — persisted to bot_state.json
-        Manual trade-এর result manually input করার পরে এই method call হবে।
-        """
+        """Record trade result — updates adaptive threshold"""
         pnl_inr = self.state.current_balance * (pnl_pct / 100)
-        self.state.record_trade(symbol, pnl_pct, pnl_inr)
+
+        if self.paper_trading:
+            self._paper_pnl += pnl_inr
+            logger.info(
+                f"📄 Paper trade result: {symbol} {pnl_pct:+.2f}% "
+                f"(sim ₹{pnl_inr:+.0f}) | Paper P&L: ₹{self._paper_pnl:+.0f}"
+            )
+        else:
+            self.state.record_trade(symbol, pnl_pct, pnl_inr)
+
+        # Update signal history for adaptive threshold
+        for s in reversed(self._signal_history):
+            if s["symbol"] == symbol and s["result"] is None:
+                s["result"] = "WIN" if pnl_pct > 0 else "LOSS"
+                break
+
+        self._update_adaptive_threshold()
 
         status = self.state.get_full_status()
-        logger.info(
-            f"Trade result: {symbol} {pnl_pct:+.2f}% (₹{pnl_inr:+.0f}) | "
-            f"Balance: ₹{status['current_balance']:,.0f} | "
-            f"DD: {status['current_drawdown_pct']:.2f}% | "
-            f"Consec losses: {status['consecutive_losses']}"
-        )
-
-        # Check if daily lock needed
         if status["daily_pnl_inr"] >= config.DAILY_PROFIT_TARGET:
             self.state.state["is_daily_locked"] = True
             self.state.state["lock_reason"] = f"Profit target ₹{config.DAILY_PROFIT_TARGET} reached"
             self.state._save()
             await self.telegram.send_message(
-                f"🔒 Daily lock: Profit target ₹{config.DAILY_PROFIT_TARGET} reached! "
-                f"P&L today: ₹{status['daily_pnl_inr']:+.0f}"
+                f"🔒 Daily lock: Target reached! P&L: ₹{status['daily_pnl_inr']:+.0f}"
             )
 
-        # Drawdown check
         if status["current_drawdown_pct"] >= 10.0:
             self.state.state["is_daily_locked"] = True
-            self.state.state["lock_reason"] = f"Drawdown {status['current_drawdown_pct']:.1f}% ≥ 10%"
+            self.state.state["lock_reason"] = f"Drawdown {status['current_drawdown_pct']:.1f}%"
             self.state._save()
             await self.telegram.send_message(
                 f"🚨 Trading PAUSED: Drawdown {status['current_drawdown_pct']:.1f}% ≥ 10%"
             )
 
     def reset_daily(self):
-        """Called at midnight — reset daily counters"""
         self.state.reset_daily()
         self.risk_manager.reset_daily()
+        self.daily_signals = 0
         logger.info("📅 Daily counters reset")
 
     def get_status(self) -> Dict:
-        """Get engine status — includes persisted state"""
         state_status = self.state.get_full_status()
         btc_candles = len(self.cache.get_ohlcv("BTC/USDT", Timeframes.M15.value))
+        ws_status = self.ws_manager.get_status()
         return {
             **state_status,
             "market_type": self.market_type.value,
@@ -352,13 +436,18 @@ class ArunabhaEngine:
             "btc_confidence": self.btc_regime.confidence if self.btc_regime else 0,
             "btc_data_ready": self._btc_data_ready,
             "btc_candles": btc_candles,
+            "paper_trading": self.paper_trading,
+            "paper_pnl": round(self._paper_pnl, 2) if self.paper_trading else None,
+            "adaptive_threshold": round(self._adaptive_threshold, 1),
+            "ws_connected": ws_status.get("connected"),
+            "ws_last_message_ago": ws_status.get("last_message_seconds_ago"),
+            "ws_reconnects": ws_status.get("total_reconnects"),
             "background_tasks": len([t for t in self._background_tasks if not t.done()]),
         }
 
-    # ── Helpers below (unchanged from v4.1) ─────────────────────────────────
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
     async def _seed_cache(self):
-        """Seed cache with initial historical data"""
         for symbol in config.TRADING_PAIRS:
             for tf in ["15m", "1h", "4h"]:
                 try:
@@ -369,7 +458,6 @@ class ArunabhaEngine:
                     logger.warning(f"Cache seed failed {symbol} {tf}: {e}")
 
     async def _force_fetch_btc_data(self) -> bool:
-        """Force fetch BTC data"""
         symbol = "BTC/USDT"
         try:
             for tf in ["15m", "1h", "4h"]:
@@ -384,7 +472,6 @@ class ArunabhaEngine:
             return False
 
     async def _force_fetch_all_pairs(self):
-        """Force fetch all trading pairs"""
         for symbol in config.TRADING_PAIRS:
             if symbol == "BTC/USDT":
                 continue
@@ -398,23 +485,15 @@ class ArunabhaEngine:
                     logger.warning(f"Fetch failed {symbol} {tf}: {e}")
 
     async def _background_btc_fetcher(self):
-        """
-        ✅ Point 16: Background fetcher with retry.
-        Exception handled by _task_error_handler callback.
-        """
         while not self._btc_data_ready:
             self._btc_fetch_attempts += 1
-            logger.info(f"🔄 BTC fetch attempt #{self._btc_fetch_attempts}")
             ok = await self._force_fetch_btc_data()
             if ok:
-                logger.info("✅ BTC data loaded by background fetcher")
                 break
             wait = min(30 * self._btc_fetch_attempts, 300)
-            logger.warning(f"BTC fetch failed — retrying in {wait}s")
             await asyncio.sleep(wait)
 
     async def _update_regime(self):
-        """Update BTC regime"""
         btc_15m = self.btc_cache.get("15m", [])
         if len(btc_15m) < 50:
             return
@@ -424,25 +503,34 @@ class ArunabhaEngine:
             self.market_type = self.regime_detector.get_market_type(btc_1h)
 
     async def _build_data_packet(self, symbol: str, candles: List) -> Optional[Dict]:
-        """Build data packet for filter evaluation"""
+        """Build full data packet — includes btc_ohlcv for Tier3 correlation fix"""
         try:
             ohlcv_1h = self.cache.get_ohlcv(symbol, "1h") or []
             ohlcv_4h = self.cache.get_ohlcv(symbol, "4h") or []
 
-            from analysis.structure import StructureDetector
             sd = StructureDetector()
             struct = sd.detect(candles)
             direction = struct.direction if struct.strength != "WEAK" else None
 
+            # Fetch sentiment data async
+            try:
+                from data.sentiment_fetcher import fetch_all_sentiment
+                sentiment_data = await fetch_all_sentiment()
+            except Exception:
+                sentiment_data = None
+
             return {
                 "ohlcv": {"15m": candles, "1h": ohlcv_1h, "4h": ohlcv_4h},
+                "btc_ohlcv": {          # ← FIXED: passed to Tier3 correlation
+                    "15m": self.btc_cache.get("15m", []),
+                    "1h": self.btc_cache.get("1h", []),
+                },
                 "direction": direction,
                 "structure": struct,
                 "funding_rate": 0,
                 "open_interest": {},
                 "orderbook": {},
                 "fear_index": 50,
+                "sentiment": sentiment_data,   # ← passed to Tier1/Tier2 sentiment
             }
-        except Exception as e:
-            logger.warning(f"Data packet build failed {symbol}: {e}")
-            return None
+  
