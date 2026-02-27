@@ -27,6 +27,7 @@ from core.constants import MarketType
 from analysis.technical import TechnicalAnalyzer
 from analysis.structure import StructureDetector
 from analysis.volume_profile import VolumeProfileAnalyzer
+from analysis.sentiment import SentimentAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class Tier2Filters:
         self.analyzer = TechnicalAnalyzer()
         self.structure = StructureDetector()
         self.volume = VolumeProfileAnalyzer()
+        self.sentiment_analyzer = SentimentAnalyzer()
         self.weights = config.TIER2_FILTERS
 
     def evaluate_all(
@@ -132,6 +134,14 @@ class Tier2Filters:
             "weight": self.weights.get("volume_on_structure", 10), "message": bos_vol_msg
         }
         total_score += bos_vol_score
+
+        # Filter 11: Sentiment Score (Structure + Sentiment confirm → bonus)
+        sent_passed, sent_score, sent_msg = self._check_sentiment_score(data, direction)
+        results["sentiment"] = {
+            "passed": sent_passed, "score": sent_score,
+            "weight": self.weights.get("sentiment", 15), "message": sent_msg
+        }
+        total_score += sent_score
 
         percentage = (total_score / max_score) * 100 if max_score > 0 else 0
         threshold = self._get_threshold(market_type)
@@ -435,3 +445,42 @@ class Tier2Filters:
             return True, 3, f"Resistance exists at {nearest_resistance:.4f}"
 
         return False, 1, "No nearby S/R levels"
+
+    def _check_sentiment_score(self, data: Dict, direction: Optional[str]) -> Tuple[bool, int, str]:
+        """
+        Tier2 Sentiment Score:
+        Structure + Sentiment একসাথে confirm করলে বেশি score।
+        RISK_ON + LONG structure → full 15 points
+        RISK_OFF + SHORT structure → full 15 points
+        Mismatch → reduced score
+        """
+        try:
+            sentiment_data = data.get("sentiment", None)
+            result = self.sentiment_analyzer.analyze(sentiment_data)
+
+            base_score = self.sentiment_analyzer.get_sentiment_score(result, direction)
+            fg = result.fear_greed_value
+            label = result.fear_greed_label.replace("_", " ")
+            alt = result.alt_season_index
+
+            # Check structure alignment for bonus
+            ohlcv = data.get("ohlcv", {}).get("15m", [])
+            if len(ohlcv) >= 30 and base_score >= 8:
+                from analysis.structure import StructureDetector
+                struct = StructureDetector().detect(ohlcv)
+                if struct.strength != "WEAK" and struct.direction == direction:
+                    # Structure + Sentiment confirm → max score
+                    return True, min(15, base_score + 3), (
+                        f"✅ Structure+Sentiment aligned: {label} ({fg}), AltSeason={alt}"
+                    )
+
+            if base_score >= 8:
+                return True, base_score, f"Sentiment OK: {label} ({fg}), AltSeason={alt}"
+            elif base_score > 0:
+                return True, base_score, f"Sentiment weak for {direction}: {label} ({fg})"
+            else:
+                return False, 0, f"❌ Sentiment blocks {direction}: {label} ({fg})"
+
+        except Exception as e:
+            logger.warning(f"Tier2 sentiment score error: {e}")
+            return True, 5, "Sentiment score skipped (error)"
