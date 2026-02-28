@@ -33,6 +33,7 @@ from analysis.technical import TechnicalAnalyzer
 from analysis.market_regime import BTCRegimeResult
 from analysis.sentiment import SentimentAnalyzer, MarketMood
 from analysis.anchored_vwap import AnchoredVWAPAnalyzer
+from analysis.amd import AMDDetector
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class Tier1Filters:
         self.analyzer  = TechnicalAnalyzer()
         self.sentiment  = SentimentAnalyzer()
         self.avwap      = AnchoredVWAPAnalyzer()
+        self.amd        = AMDDetector()
 
     def evaluate_all(
         self,
@@ -70,7 +72,8 @@ class Tier1Filters:
         check("liquidity",     self._check_liquidity,     data)
         check("session",       self._check_session)
         check("sentiment",     self._check_sentiment,     direction, data)
-        check("session_vwap",  self._check_session_vwap,  direction, data)   # ← NEW v6.0
+        check("session_vwap",  self._check_session_vwap,  direction, data)
+        check("amd_phase",     self._check_amd_phase,     direction, data)   # ← NEW
 
         all_passed = all(r["passed"] for r in results.values())
         return all_passed, results
@@ -160,6 +163,82 @@ class Tier1Filters:
             return True, f"Session VWAP error ({e}) — allowing"
 
         return True, "Session VWAP OK"
+
+    # ──────────────────────────────────────────────────────────────────
+    # NEW v7.0: AMD Phase Filter
+    # ──────────────────────────────────────────────────────────────────
+
+    def _check_amd_phase(
+        self,
+        direction: Optional[str],
+        data: Dict[str, Any]
+    ) -> Tuple[bool, str]:
+        """
+        AMD Phase Tier1 filter.
+
+        BLOCK: Accumulation phase — smart money এখনো position নেয়নি।
+               এই phase-এ trade = noise trade।
+
+        PASS:  Manipulation শেষ (post-manipulation) → BEST entry window।
+               Distribution active → trend ride করো।
+               Unknown → allow (data কম, conservative)।
+
+        কেন Tier1-এ:
+          Accumulation-এ bot অনেক false signal দিচ্ছিল।
+          AMD phase block করলে win rate ~8% বাড়ার সম্ভাবনা।
+        """
+        ohlcv = data.get("ohlcv", {}).get("15m", [])
+        if len(ohlcv) < 30:
+            return True, "Insufficient data — AMD skip"
+
+        try:
+            import pytz
+            now      = datetime.now(pytz.timezone("Asia/Kolkata"))
+            hour_ist = now.hour
+        except Exception:
+            hour_ist = None
+
+        try:
+            result = self.amd.analyze(ohlcv, direction=direction, session_hour_ist=hour_ist)
+
+            # BLOCK: pure accumulation
+            if result.phase == "ACCUMULATION" and result.phase_confidence >= 65:
+                return False, (
+                    f"AMD BLOCK: Accumulation phase ({result.phase_confidence}%) — "
+                    f"{result.phase_reason}"
+                )
+
+            # PASS: post-manipulation = best entry
+            if result.post_manipulation:
+                manip_dir = result.manipulation_direction
+                return True, (
+                    f"AMD PASS: Post-manipulation sweep ({manip_dir}) — "
+                    f"Distribution starting. Score={result.amd_score}/10"
+                )
+
+            # PASS: distribution active
+            if result.distribution_active:
+                return True, (
+                    f"AMD PASS: Distribution {result.distribution_direction} "
+                    f"({result.distribution_strength}, "
+                    f"vol {result.momentum_ratio:.1f}x)"
+                )
+
+            # PASS: manipulation in progress (allow — entry window opening)
+            if result.manipulation_detected:
+                return True, (
+                    f"AMD PASS: Manipulation detected ({result.manipulation_direction}) — "
+                    f"watch for reversal"
+                )
+
+            # PASS: unknown or low confidence accumulation
+            return True, (
+                f"AMD: Phase={result.phase} ({result.phase_confidence}%) — allowing"
+            )
+
+        except Exception as e:
+            logger.warning(f"AMD filter error: {e} — allowing")
+            return True, f"AMD error ({e}) — allowing"
 
     # ──────────────────────────────────────────────────────────────────
     # Existing filters
