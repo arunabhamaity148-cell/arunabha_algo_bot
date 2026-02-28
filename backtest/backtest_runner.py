@@ -1,16 +1,22 @@
 """
-ARUNABHA ALGO BOT - Backtest Runner v4.1
+ARUNABHA ALGO BOT - Backtest Runner v5.0
+=========================================
+CRITICAL FIX:
+  আগে: limit = min(days * 96, 1000) → 90 দিনের backtest-এও শুধু 1000 candles (10 দিন)!
+  এখন: fetch_historical_data() with pagination → সত্যিকারের 90 দিন data
 
-FIX BUG-26: Backtest এখন main.py এর সাথে connected
-- CLI: python main.py --mode backtest --symbol ETH/USDT --days 30
-- API: POST /backtest (web mode এ)
-- Binance REST থেকে historical data নিয়ে backtest run করে
-- Report: backtest_reports/ folder এ save হয়
+  90 days × 96 candles/day = 8640 candles দরকার।
+  Binance max 1000/request → 9টা paginated request করে সব আনো।
+
+ALSO FIXED:
+  - Walk-forward minimum: 1000 candles (was 5760 — impossible to meet)
+  - async ccxt close() added (Unclosed client session warning fix)
+  - Trade count normalized by actual days (not candle count)
 """
 
 import asyncio
 import logging
-import argparse
+import pandas as pd
 from typing import Optional, List
 from datetime import datetime, timedelta
 
@@ -20,9 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 class BacktestRunner:
-    """
-    Connects backtest engine to live REST client for historical data
-    """
 
     def __init__(self):
         from data.rest_client import RESTClient
@@ -30,8 +33,8 @@ class BacktestRunner:
         from backtest.report_generator import ReportGenerator
 
         self.rest_client = RESTClient()
-        self.engine = BacktestEngine(initial_capital=config.ACCOUNT_SIZE)
-        self.reporter = ReportGenerator()
+        self.engine      = BacktestEngine(initial_capital=config.ACCOUNT_SIZE)
+        self.reporter    = ReportGenerator()
 
     async def run(
         self,
@@ -42,220 +45,171 @@ class BacktestRunner:
         end_date: Optional[str] = None,
         report_format: str = "all"
     ) -> dict:
-        """
-        Run a backtest for a symbol
 
-        Args:
-            symbol:      Trading pair, e.g. "ETH/USDT"
-            timeframe:   Candle timeframe, e.g. "15m"
-            days:        How many days of history to fetch (if no start_date)
-            start_date:  Optional start date string "YYYY-MM-DD"
-            end_date:    Optional end date string "YYYY-MM-DD"
-            report_format: "txt", "csv", "json", "html", or "all"
+        logger.info("=" * 60)
+        logger.info("ARUNABHA ALGO BOT — BACKTEST MODE")
+        logger.info("=" * 60)
+        logger.info(f"Backtest starting: {symbol} {timeframe} | {days} days")
 
-        Returns:
-            dict with result summary and file paths
-        """
-        logger.info(f"🔄 Backtest starting: {symbol} {timeframe} | {days} days")
-
-        # Step 1: Connect REST API
+        # ── Step 1: Connect ──────────────────────────────────────────
         try:
             await self.rest_client.connect()
         except Exception as e:
-            logger.error(f"❌ REST connection failed: {e}")
+            logger.error(f"REST connection failed: {e}")
             return {"error": f"REST connection failed: {e}"}
 
-        # Step 2: Fetch historical data
-        logger.info(f"📡 Fetching historical data for {symbol}...")
+        # ── Step 2: Fetch historical data (PAGINATED) ────────────────
+        logger.info(f"Fetching historical data for {symbol}...")
+        candles = []
         try:
-            # Calculate number of candles needed
-            candles_per_day = {
-                "1m": 1440, "5m": 288, "15m": 96,
-                "30m": 48,  "1h": 24,  "4h": 6, "1d": 1
-            }
-            per_day = candles_per_day.get(timeframe, 96)
-            limit = min(days * per_day, 1000)  # Binance max 1000 per request
+            # FIXED: use fetch_historical_data() for paginated fetch
+            # This gets the actual days requested, not just 1000 candles
+            candles = await self.rest_client.fetch_historical_data(
+                symbol=symbol,
+                timeframe=timeframe,
+                days=days,
+            )
 
-            candles = await self.rest_client.fetch_ohlcv_rest(symbol, timeframe, limit)
-
-            if not candles or len(candles) < 50:
-                msg = f"Insufficient data: got {len(candles) if candles else 0} candles, need 50+"
-                logger.error(f"❌ {msg}")
+            if not candles or len(candles) < 60:
+                msg = (
+                    f"Insufficient data: got {len(candles) if candles else 0} candles. "
+                    f"Need at least 60."
+                )
+                logger.error(msg)
+                await self._close_exchange()
                 return {"error": msg}
 
-            logger.info(f"✅ Fetched {len(candles)} candles for {symbol}")
+            logger.info(f"Fetched {len(candles)} candles for {symbol}")
 
         except Exception as e:
-            logger.error(f"❌ Data fetch failed: {e}")
+            logger.error(f"Data fetch failed: {e}")
+            await self._close_exchange()
             return {"error": f"Data fetch failed: {e}"}
 
-        # Step 3: Convert to DataFrame
+        # ── Step 3: Convert to DataFrame ─────────────────────────────
         try:
-            import pandas as pd
-            df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(
+                candles,
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df.set_index("timestamp", inplace=True)
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = df[col].astype(float)
+            df = df[~df.index.duplicated(keep="last")]
+            df.sort_index(inplace=True)
 
-            logger.info(f"📊 Data range: {df.index[0]} → {df.index[-1]}")
-
-        except Exception as e:
-            logger.error(f"❌ DataFrame conversion failed: {e}")
-            return {"error": f"DataFrame conversion failed: {e}"}
-
-        # Step 4: Run backtest
-        logger.info("⚙️ Running backtest engine...")
-        try:
-            result = self.engine.run(
-                df=df,
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date
+            logger.info(
+                f"Data range: {df.index[0]} to {df.index[-1]} "
+                f"({len(df)} candles)"
             )
+
         except Exception as e:
-            logger.error(f"❌ Backtest engine error: {e}")
-            return {"error": f"Backtest engine error: {e}"}
+            logger.error(f"DataFrame conversion failed: {e}")
+            await self._close_exchange()
+            return {"error": f"DataFrame error: {e}"}
 
-        # Step 5: Generate report
-        end_str = end_date or datetime.now().strftime("%Y-%m-%d")
-        start_str = start_date or (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-
+        # ── Step 4: Run backtest ─────────────────────────────────────
+        logger.info("Running backtest engine...")
         try:
-            files = self.reporter.generate_report(
-                result=result,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_str,
-                end_date=end_str,
-                format=report_format
-            )
+            result = self.engine.run(df, symbol, start_date, end_date)
         except Exception as e:
-            logger.warning(f"⚠️ Report generation failed: {e}")
-            files = {}
+            logger.error(f"Backtest engine failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            await self._close_exchange()
+            return {"error": f"Backtest failed: {e}"}
 
-        # Step 6: Walk-forward validation (mandatory — overfitting check)
-        wf_summary = {}
-        if len(df) >= 200:
-            logger.info("📊 Running walk-forward validation...")
-            try:
-                from backtest.walk_forward import WalkForwardAnalyzer
-                wf = WalkForwardAnalyzer(self.engine)
-                wf_result = wf.analyze(df, symbol=symbol)
-                wf_summary = {
-                    "windows": wf_result.get("total_windows", 0),
-                    "avg_train_win_rate": round(wf_result.get("avg_train_win_rate", 0), 2),
-                    "avg_test_win_rate": round(wf_result.get("avg_test_win_rate", 0), 2),
-                    "robustness_score": round(wf_result.get("robustness_score", 0), 2),
-                    "verdict": wf_result.get("verdict", "UNKNOWN"),
-                    "recommendation": wf_result.get("recommendation", ""),
-                }
-                logger.info(
-                    f"📊 Walk-forward: {wf_summary['windows']} windows | "
-                    f"Train={wf_summary['avg_train_win_rate']:.1f}% | "
-                    f"Test={wf_summary['avg_test_win_rate']:.1f}% | "
-                    f"Robustness={wf_summary['robustness_score']:.2f} | "
-                    f"Verdict={wf_summary['verdict']}"
-                )
-                if wf_summary["verdict"] == "OVERFIT":
-                    logger.warning(
-                        f"⚠️ OVERFITTING DETECTED: Train {wf_summary['avg_train_win_rate']:.1f}% "
-                        f"vs Test {wf_summary['avg_test_win_rate']:.1f}%"
-                    )
-            except Exception as e:
-                logger.warning(f"⚠️ Walk-forward failed: {e}")
-        else:
-            wf_summary = {"verdict": "SKIPPED", "reason": "Insufficient data (<200 candles)"}
-            logger.warning("⚠️ Walk-forward skipped: insufficient data")
-
-        # Step 7: Print summary
+        # ── Step 5: Print summary ─────────────────────────────────────
         self.engine.print_summary(result)
 
+        # ── Step 6: Save reports ──────────────────────────────────────
+        file_paths = {}
+        try:
+            file_paths = self.reporter.save_all(result, symbol, timeframe)
+            logger.info(f"Reports saved: {list(file_paths.values())}")
+        except Exception as e:
+            logger.warning(f"Report save failed: {e}")
+
+        # ── Step 7: Walk-forward validation ──────────────────────────
+        logger.info("Running walk-forward validation...")
+        wf_result = {}
+        try:
+            from backtest.walk_forward import WalkForwardValidator
+            wf = WalkForwardValidator()
+            wf_result = wf.validate(candles, symbol, timeframe)
+            logger.info(
+                f"Walk-forward: {wf_result.get('windows', 0)} windows | "
+                f"Train={wf_result.get('avg_train_pf', 0):.2f} | "
+                f"Test={wf_result.get('avg_test_pf', 0):.2f} | "
+                f"Verdict={wf_result.get('verdict', 'N/A')}"
+            )
+        except Exception as e:
+            logger.warning(f"Walk-forward failed: {e}")
+            wf_result = {"verdict": "ERROR", "error": str(e)}
+
+        # ── Step 8: Close exchange (fixes "Unclosed client session") ──
+        await self._close_exchange()
+
         return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "start": start_str,
-            "end": end_str,
-            "candles": len(candles),
-            "summary": {
-                "total_trades": result.total_trades,
-                "win_rate": round(result.win_rate, 2),
-                "total_return_pct": round(result.total_pnl_percent, 2),
-                "profit_factor": round(result.profit_factor, 2),
-                "sharpe_ratio": round(result.sharpe_ratio, 2),
-                "max_drawdown_pct": round(result.max_drawdown_percent, 2),
-                "avg_rr": round(result.avg_rr, 2),
-                "best_trade_pct": round(result.best_trade, 2),
-                "worst_trade_pct": round(result.worst_trade, 2),
-            },
-            "walk_forward": wf_summary,
-            "report_files": files
+            "symbol":        symbol,
+            "timeframe":     timeframe,
+            "days":          days,
+            "candles":       len(candles),
+            "total_trades":  result.total_trades,
+            "win_rate":      result.win_rate,
+            "total_return":  result.total_pnl_percent,
+            "profit_factor": result.profit_factor,
+            "sharpe_ratio":  result.sharpe_ratio,
+            "max_drawdown":  result.max_drawdown_percent,
+            "expectancy":    result.expectancy,
+            "signals_blocked": result.signals_blocked,
+            "walk_forward":  wf_result,
+            "reports":       file_paths,
         }
 
-    async def run_all_pairs(
-        self,
-        timeframe: str = "15m",
-        days: int = 30
-    ) -> dict:
-        """Run backtest for all configured trading pairs"""
-        all_results = {}
-
-        for symbol in config.TRADING_PAIRS:
-            logger.info(f"\n{'='*50}")
-            logger.info(f"🔄 Running backtest for {symbol}")
-            logger.info(f"{'='*50}")
-
-            result = await self.run(
-                symbol=symbol,
-                timeframe=timeframe,
-                days=days
-            )
-            all_results[symbol] = result
-            await asyncio.sleep(1)  # rate limit
-
-        # Print comparison table
-        logger.info("\n" + "="*70)
-        logger.info("BACKTEST COMPARISON — ALL PAIRS")
-        logger.info("="*70)
-        logger.info(f"{'Symbol':<15} {'Trades':>7} {'WinRate':>9} {'Return%':>9} {'PF':>6} {'MaxDD%':>8}")
-        logger.info("-"*70)
-
-        for symbol, res in all_results.items():
-            if "error" in res:
-                logger.info(f"{symbol:<15} {'ERROR':>7} {res['error'][:30]}")
-                continue
-            s = res["summary"]
-            logger.info(
-                f"{symbol:<15} {s['total_trades']:>7} "
-                f"{s['win_rate']:>8.1f}% {s['total_return_pct']:>+8.2f}% "
-                f"{s['profit_factor']:>6.2f} {s['max_drawdown_pct']:>7.2f}%"
-            )
-
-        logger.info("="*70)
-        return all_results
+    async def _close_exchange(self):
+        """Properly close ccxt exchange to avoid 'Unclosed client session'"""
+        try:
+            if hasattr(self.rest_client, "exchange") and self.rest_client.exchange:
+                await self.rest_client.exchange.close()
+        except Exception:
+            pass
 
 
-async def run_backtest_cli(args):
-    """Entry point for CLI backtest mode"""
-    logger.info("=" * 60)
-    logger.info("📊 ARUNABHA ALGO BOT — BACKTEST MODE")
-    logger.info("=" * 60)
+def run_backtest_cli():
+    """Entry point for CLI: python main.py --mode backtest"""
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol",    default="BTC/USDT")
+    parser.add_argument("--timeframe", default="15m")
+    parser.add_argument("--days",      type=int, default=30)
+    args, _ = parser.parse_known_args()
 
-    runner = BacktestRunner()
-
-    if args.all_pairs:
-        results = await runner.run_all_pairs(
-            timeframe=args.timeframe,
-            days=args.days
-        )
-        return results
-    else:
+    async def _run():
+        runner = BacktestRunner()
         result = await runner.run(
             symbol=args.symbol,
             timeframe=args.timeframe,
             days=args.days,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            report_format=args.report_format
         )
-        return result
+
+        print("\n" + "=" * 50)
+        if "error" in result:
+            print(f"BACKTEST FAILED: {result['error']}")
+        else:
+            print(f"BACKTEST COMPLETE: {result['symbol']}")
+            print(f"   Trades:          {result['total_trades']}")
+            print(f"   Signals Blocked: {result.get('signals_blocked', 0)}")
+            print(f"   Win Rate:        {result['win_rate']:.1f}%")
+            print(f"   Total Return:    {result['total_return']:+.2f}%")
+            print(f"   Profit Factor:   {result['profit_factor']:.2f}")
+            print(f"   Sharpe Ratio:    {result['sharpe_ratio']:.2f}")
+            print(f"   Max Drawdown:    {result['max_drawdown']:.2f}%")
+            if result.get("reports"):
+                print(f"   Reports saved:")
+                for fmt, path in result["reports"].items():
+                    print(f"      {fmt}: {path}")
+        print("=" * 50)
+
+    asyncio.run(_run())
