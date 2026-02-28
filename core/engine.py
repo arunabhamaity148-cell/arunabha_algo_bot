@@ -212,12 +212,6 @@ class ArunabhaEngine:
             elapsed = (datetime.now() - last).total_seconds() / 60
             if elapsed < config.COOLDOWN_MINUTES:
                 return
-# Cooldown check
-        last = self.last_signal_time.get(symbol)
-        if last:
-            elapsed = (datetime.now() - last).total_seconds() / 60
-            if elapsed < config.COOLDOWN_MINUTES:
-                return
 
         # Risk check
         can_trade, reason = self.risk_manager.can_trade(symbol, self.market_type)
@@ -516,13 +510,44 @@ class ArunabhaEngine:
             await asyncio.sleep(wait)
 
     async def _update_regime(self):
+        """
+        Issue 4 FIX: detect() → detect_btc_regime() + get_market_type()
+        backward compat wrapper এখন market_regime.py-তে আছে,
+        তাই detect() call করলেও কাজ করবে।
+        কিন্তু explicitly correct methods call করছি।
+        """
         btc_15m = self.btc_cache.get("15m", [])
         if len(btc_15m) < 50:
             return
-        self.btc_regime = self.regime_detector.detect(btc_15m)
+
         btc_1h = self.btc_cache.get("1h", [])
-        if len(btc_1h) >= 20:
-            self.market_type = self.regime_detector.get_market_type(btc_1h)
+        btc_4h = self.btc_cache.get("4h", [])
+
+        try:
+            # detect_btc_regime() needs 15m + 1h + 4h
+            if btc_1h and btc_4h:
+                self.btc_regime = self.regime_detector.detect_btc_regime(
+                    btc_15m, btc_1h, btc_4h
+                )
+            else:
+                # Fallback: wrapper aggregates internally
+                self.btc_regime = self.regime_detector.detect(btc_15m)
+
+            # Market type from 1h (or proxy)
+            if len(btc_1h) >= 20:
+                self.market_type = self.regime_detector.detect_market_type(
+                    btc_15m, btc_1h
+                )
+            elif len(btc_15m) >= 30:
+                # Aggregate 15m → 1h as proxy
+                btc_1h_proxy = self.regime_detector._aggregate_candles(btc_15m, 4)
+                self.market_type = self.regime_detector.detect_market_type(
+                    btc_15m, btc_1h_proxy
+                )
+
+        except Exception as e:
+            logger.error(f"_update_regime error: {e}")
+            # Keep last known regime on error
 
     async def _build_data_packet(self, symbol: str, candles: List) -> Optional[Dict]:
         """Build full data packet — includes btc_ohlcv for Tier3 correlation fix"""
