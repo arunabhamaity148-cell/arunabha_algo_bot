@@ -56,9 +56,9 @@ class WalkForwardAnalyzer:
 
         Rolling forward by step_size → multiple windows → aggregate stats
         """
-        if len(df) < min_window_days * 2 * 96:  # ~2 months of 15m data
-            logger.warning("Insufficient data for walk-forward — need at least 2 months")
-            return self._insufficient_data_result()
+        if len(df) < 1000:  # minimum ~10 days of 15m data for meaningful walk-forward
+            logger.warning(f"Insufficient data for walk-forward — got {len(df)} candles, need 1000+")
+            return self._insufficient_data_result(len(df))
 
         logger.info(
             f"Walk-forward: {symbol} | {len(df)} candles | "
@@ -204,12 +204,15 @@ class WalkForwardAnalyzer:
                 f"Likely overfit to train data"
             )
 
-    def _insufficient_data_result(self) -> Dict:
+    def _insufficient_data_result(self, candle_count: int = 0) -> Dict:
         return {
             "windows": [],
             "statistics": {},
             "is_robust": False,
-            "verdict": "❌ Insufficient data — need at least 2 months of 15m data (≈5760 candles)"
+            "verdict": (
+                f"Insufficient data — got {candle_count} candles, need 1000+ "
+                f"(use --days 15+ for 15m timeframe)"
+            )
         }
 
     def print_summary(self):
