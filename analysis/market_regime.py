@@ -279,3 +279,64 @@ class MarketRegimeDetector:
         elif regime.strength == "MODERATE":
             base_conf = int(base_conf * 0.7)
         return base_conf
+
+    # ── Backward Compatibility Wrappers (Issue 1 + Issue 4 Fix) ──────
+
+    def detect(self, btc_15m: List[List[float]]) -> "BTCRegimeResult":
+        """
+        BACKWARD COMPATIBILITY: engine.py calls regime_detector.detect(btc_15m)
+        কিন্তু আসল method হলো detect_btc_regime(15m, 1h, 4h)।
+
+        এই wrapper:
+        1. btc_15m থেকে 1h/4h approximate করে (candle aggregation)
+        2. detect_btc_regime() call করে return করে
+        """
+        if not btc_15m or len(btc_15m) < 30:
+            return BTCRegimeResult(
+                regime=BTCRegime.UNKNOWN,
+                confidence=0,
+                direction="SIDEWAYS",
+                strength="WEAK",
+                can_trade=False,
+                trade_mode="BLOCK",
+                reason="Insufficient BTC data",
+            )
+
+        # 15m → 1h: প্রতি 4টা candle merge
+        btc_1h = self._aggregate_candles(btc_15m, 4)
+        # 15m → 4h: প্রতি 16টা candle merge
+        btc_4h = self._aggregate_candles(btc_15m, 16)
+
+        return self.detect_btc_regime(btc_15m, btc_1h, btc_4h)
+
+    def get_market_type(self, btc_1h: List[List[float]]) -> "MarketType":
+        """
+        BACKWARD COMPATIBILITY: engine.py calls regime_detector.get_market_type(btc_1h)
+        কিন্তু আসল method হলো detect_market_type(15m, 1h)।
+        """
+        if not btc_1h or len(btc_1h) < 14:
+            return MarketType.UNKNOWN
+        # 1h থেকে 15m approximate (4x upsample — শুধু as proxy)
+        btc_15m_proxy = []
+        for c in btc_1h:
+            for _ in range(4):
+                btc_15m_proxy.append(c)
+        return self.detect_market_type(btc_15m_proxy, btc_1h)
+
+    def _aggregate_candles(
+        self, candles: List[List[float]], factor: int
+    ) -> List[List[float]]:
+        """N candle → 1 candle merge করে higher TF বানাও"""
+        result = []
+        for i in range(0, len(candles) - factor + 1, factor):
+            chunk = candles[i: i + factor]
+            if not chunk:
+                continue
+            ts    = chunk[0][0]
+            open_ = float(chunk[0][1])
+            high  = max(float(c[2]) for c in chunk)
+            low   = min(float(c[3]) for c in chunk)
+            close = float(chunk[-1][4])
+            vol   = sum(float(c[5]) for c in chunk)
+            result.append([ts, open_, high, low, close, vol])
+        return result
