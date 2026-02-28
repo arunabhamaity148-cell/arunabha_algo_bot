@@ -114,6 +114,7 @@ TIER1_FILTERS = [
 TIER2_FILTERS = {
     # v6.0: vwap_position → anchored_vwap (session+weekly+event VWAP)
     # v6.0: orderflow_cvd added (CVD divergence + absorption)
+    # v7.0: amd_phase added (Accumulation/Manipulation/Distribution scoring)
     "mtf_confirmation": 20,
     "volume_profile": 15,
     "funding_rate": 10,
@@ -121,11 +122,12 @@ TIER2_FILTERS = {
     "rsi_divergence": 15,
     "ema_stack": 10,
     "atr_percent": 10,
-    "anchored_vwap": 10,           # ← v6.0: session+weekly+event VWAP (was vwap_position:5)
+    "anchored_vwap": 10,
     "support_resistance": 5,
     "volume_on_structure": 10,
     "sentiment": 15,
-    "orderflow_cvd": 12,           # ← v6.0: CVD divergence + absorption (NEW)
+    "orderflow_cvd": 12,
+    "amd_phase": 15,               # ← v7.0: post-manipulation=15, distribution=12, accum=0
 }
 
 TIER3_FILTERS = [
