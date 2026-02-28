@@ -1,10 +1,26 @@
 """
-ARUNABHA ALGO BOT - Tier 1 Filters v5.0
+ARUNABHA ALGO BOT - Tier 1 Filters v6.0
 =========================================
-FIXES:
-ISSUE 5:  OrderBook data type — float conversion + strict "no data" handling
-ISSUE 15: Extreme Fear (<=15) block LONG — properly implemented
-ISSUE 11: Sentiment ROC used in Tier1 (FALLING_FAST triggers earlier)
+MANDATORY: সব filter pass না হলে signal block।
+
+NEW (v6.0):
+  SESSION VWAP filter — Tier1-এ add করা হয়েছে।
+  Best choice কারণ:
+    - Session VWAP institutional reference point। Price wrong side = setup invalid।
+    - Calculation simple, fast, reliable — Tier1-এ overhead নেই।
+    - Weekly/Event VWAP Tier2-তে থাকবে (scoring)।
+    - CVD/Sweep Tier1-এ দেওয়া হয়নি — rare pattern, অনেক signal miss হত।
+
+  Logic:
+    - LONG signal: price must be ABOVE session VWAP বা AT (±0.5%)
+    - SHORT signal: price must be BELOW session VWAP বা AT (±0.5%)
+    - AT zone (±0.5%) = dono direction allow, price at fair value
+    - First 30 min of session (< 2 candles) = skip (VWAP not meaningful yet)
+
+FIXED (v5.1):
+  ISSUE 5: OrderBook data type — float conversion
+  ISSUE 11: Sentiment ROC in Tier1
+  ISSUE 15: F&G <= 15 blocks LONG (capitulation)
 """
 
 import logging
@@ -16,15 +32,22 @@ from core.constants import MarketType, BTCRegime, SessionType
 from analysis.technical import TechnicalAnalyzer
 from analysis.market_regime import BTCRegimeResult
 from analysis.sentiment import SentimentAnalyzer, MarketMood
+from analysis.anchored_vwap import AnchoredVWAPAnalyzer
 
 logger = logging.getLogger(__name__)
+
+# Session VWAP tolerance — AT zone এর মধ্যে থাকলে both direction ok
+SESSION_VWAP_TOLERANCE_PCT = 0.50   # ±0.50%
+# প্রথম কয়টা candle VWAP skip করবো
+SESSION_VWAP_MIN_CANDLES = 2
 
 
 class Tier1Filters:
 
     def __init__(self):
-        self.analyzer = TechnicalAnalyzer()
-        self.sentiment_analyzer = SentimentAnalyzer()
+        self.analyzer  = TechnicalAnalyzer()
+        self.sentiment  = SentimentAnalyzer()
+        self.avwap      = AnchoredVWAPAnalyzer()
 
     def evaluate_all(
         self,
@@ -37,32 +60,110 @@ class Tier1Filters:
 
         results = {}
 
-        # F1: BTC Regime
-        p, m = self._check_btc_regime(btc_regime, direction)
-        results["btc_regime"] = {"passed": p, "message": m, "weight": "MANDATORY"}
+        def check(name, fn, *args):
+            p, m = fn(*args)
+            results[name] = {"passed": p, "message": m, "weight": "MANDATORY"}
 
-        # F2: Structure
-        p, m = self._check_structure(data)
-        results["structure"] = {"passed": p, "message": m, "weight": "MANDATORY"}
-
-        # F3: Volume
-        p, m = self._check_volume(data)
-        results["volume"] = {"passed": p, "message": m, "weight": "MANDATORY"}
-
-        # F4: Liquidity (ISSUE 5 FIXED)
-        p, m = self._check_liquidity(data)
-        results["liquidity"] = {"passed": p, "message": m, "weight": "MANDATORY"}
-
-        # F5: Session
-        p, m = self._check_session()
-        results["session"] = {"passed": p, "message": m, "weight": "MANDATORY"}
-
-        # F6: Sentiment (ISSUE 11 + ISSUE 15 FIXED)
-        p, m = self._check_sentiment(direction, data)
-        results["sentiment"] = {"passed": p, "message": m, "weight": "MANDATORY"}
+        check("btc_regime",    self._check_btc_regime,    btc_regime, direction)
+        check("structure",     self._check_structure,     data)
+        check("volume",        self._check_volume,        data)
+        check("liquidity",     self._check_liquidity,     data)
+        check("session",       self._check_session)
+        check("sentiment",     self._check_sentiment,     direction, data)
+        check("session_vwap",  self._check_session_vwap,  direction, data)   # ← NEW v6.0
 
         all_passed = all(r["passed"] for r in results.values())
         return all_passed, results
+
+    # ──────────────────────────────────────────────────────────────────
+    # NEW v6.0: Session VWAP Filter
+    # ──────────────────────────────────────────────────────────────────
+
+    def _check_session_vwap(
+        self,
+        direction: Optional[str],
+        data: Dict[str, Any]
+    ) -> Tuple[bool, str]:
+        """
+        Session VWAP Tier1 filter.
+
+        কেন শুধু Session VWAP (Weekly/Event নয়):
+          Session VWAP = আজকের fair value। Price এর wrong side = 
+          institutional bias against তোমার direction।
+          Weekly VWAP = longer context, Tier2-তে scoring করে।
+          Event VWAP = BOS থেকে, rare — Tier2/3-তে থাকুক।
+
+        Pass conditions:
+          LONG:  price >= session_vwap × (1 - tolerance)   [above or AT]
+          SHORT: price <= session_vwap × (1 + tolerance)   [below or AT]
+          AT zone (±0.5%): always pass — fair value entry both sides ok
+
+        Skip conditions:
+          - Session candles < 2 (VWAP too young, meaningless)
+          - direction = None (no filter needed)
+          - OHLCV data not available
+
+        Block conditions:
+          LONG below session VWAP by > 0.5%  → price against bias → BLOCK
+          SHORT above session VWAP by > 0.5% → price against bias → BLOCK
+        """
+        if not direction:
+            return True, "No direction — session VWAP skip"
+
+        ohlcv = data.get("ohlcv", {}).get("15m", [])
+        if len(ohlcv) < 5:
+            return True, "Insufficient data — session VWAP skip"
+
+        try:
+            avwap_result = self.avwap.analyze(ohlcv)
+            session_vwap = avwap_result.session_vwap
+            pos = avwap_result.price_vs_session
+            dev = avwap_result.deviation_pct.get("session", 0.0)
+
+            # Session-এ candle কম → VWAP reliable না, skip করো
+            session_candles_count = len(self.avwap._get_session_candles(ohlcv))
+            if session_candles_count < SESSION_VWAP_MIN_CANDLES:
+                return True, f"Session too new ({session_candles_count} candles) — VWAP skip"
+
+            if pos == "AT":
+                return True, (
+                    f"AT Session VWAP {session_vwap:.4f} (±{abs(dev):.2f}%) "
+                    f"— fair value entry"
+                )
+
+            if direction == "LONG":
+                if pos == "ABOVE":
+                    return True, (
+                        f"LONG above Session VWAP {session_vwap:.4f} "
+                        f"(+{dev:.2f}%) ✓"
+                    )
+                else:  # BELOW
+                    return False, (
+                        f"LONG blocked: price {abs(dev):.2f}% BELOW Session VWAP "
+                        f"{session_vwap:.4f} — institutional bias down"
+                    )
+
+            elif direction == "SHORT":
+                if pos == "BELOW":
+                    return True, (
+                        f"SHORT below Session VWAP {session_vwap:.4f} "
+                        f"({dev:.2f}%) ✓"
+                    )
+                else:  # ABOVE
+                    return False, (
+                        f"SHORT blocked: price {dev:.2f}% ABOVE Session VWAP "
+                        f"{session_vwap:.4f} — institutional bias up"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Session VWAP filter error: {e} — allowing")
+            return True, f"Session VWAP error ({e}) — allowing"
+
+        return True, "Session VWAP OK"
+
+    # ──────────────────────────────────────────────────────────────────
+    # Existing filters
+    # ──────────────────────────────────────────────────────────────────
 
     def _check_sentiment(
         self,
@@ -70,63 +171,49 @@ class Tier1Filters:
         data: Dict[str, Any]
     ) -> Tuple[bool, str]:
         """
-        ISSUE 11 FIX: Sentiment ROC used in Tier1
-        ISSUE 15 FIX: Extreme Fear (<=15) blocks LONG
-
-        Logic:
-        - F&G <= 15 → block LONG (extreme fear, worse than <=20)
-        - F&G <= 20 AND falling → block LONG (panic accelerating)
-        - F&G >= 80 AND rising → block SHORT (bubble accelerating)
-        - FALLING_FAST from any level below 40 → block LONG
+        ISSUE 11: ROC used | ISSUE 15: F&G <= 15 always blocks LONG
         """
         try:
-            sentiment_data = data.get("sentiment")
-            result = self.sentiment_analyzer.analyze(sentiment_data)
-            fg = result.fear_greed_value
-            roc = result.rate_of_change
-            label = result.fear_greed_label.replace("_", " ")
+            result = self.sentiment.analyze(data.get("sentiment"))
+            fg     = result.fear_greed_value
+            roc    = result.rate_of_change
+            label  = result.fear_greed_label.replace("_", " ")
             change = result.fear_greed_change
 
             if direction == "LONG":
-                # ISSUE 15 FIX: <= 15 is extreme fear — always block
                 if fg <= 15:
-                    return False, f"🚫 LONG blocked: Extreme Fear ({fg}) — market capitulation"
-
-                # ISSUE 11 FIX: <= 20 falling → panic accelerating
+                    return False, f"LONG blocked: Extreme Fear ({fg}) — capitulation"
                 if fg <= 20 and roc in ("FALLING", "FALLING_FAST"):
-                    return False, f"🚫 LONG blocked: Fear {fg} falling ({roc}, Δ{change:+d})"
-
-                # ISSUE 11 FIX: FALLING_FAST below 40 is dangerous for longs
+                    return False, f"LONG blocked: Fear {fg} falling ({roc} d{change:+d})"
                 if roc == "FALLING_FAST" and fg < 40:
-                    return False, f"🚫 LONG blocked: Sentiment deteriorating fast ({fg}↓↓ Δ{change:+d})"
-
-                # Standard: is_long_blocked from analyzer (covers >20 stable extreme fear)
-                if self.sentiment_analyzer.is_long_blocked(result):
-                    return False, f"🚫 LONG blocked: Extreme Fear ({fg})"
+                    return False, f"LONG blocked: Sentiment deteriorating fast ({fg} d{change:+d})"
+                if self.sentiment.is_long_blocked(result):
+                    return False, f"LONG blocked: Extreme Fear ({fg})"
 
             elif direction == "SHORT":
-                # ISSUE 11 FIX: rising fast above 75 → block short (parabolic greed)
                 if fg >= 75 and roc == "RISING_FAST":
-                    return False, f"🚫 SHORT blocked: Extreme Greed rising fast ({fg}↑↑ Δ{change:+d})"
+                    return False, f"SHORT blocked: Extreme Greed rising ({fg} d{change:+d})"
+                if self.sentiment.is_short_blocked(result):
+                    return False, f"SHORT blocked: Extreme Greed ({fg})"
 
-                if self.sentiment_analyzer.is_short_blocked(result):
-                    return False, f"🚫 SHORT blocked: Extreme Greed ({fg})"
-
-            # Recovery mood → note it
-            mood_note = ""
+            mood = ""
             if result.market_mood == MarketMood.RECOVERY:
-                mood_note = " | 📈 Recovery signal"
+                mood = " | Recovery signal"
 
             return True, (
-                f"Sentiment OK: {label} ({fg} {roc} Δ{change:+d})"
-                f", AltSeason={result.alt_season_index}{mood_note}"
+                f"Sentiment OK: {label} ({fg} {roc} d{change:+d})"
+                f", Alt={result.alt_season_index}{mood}"
             )
 
         except Exception as e:
-            logger.warning(f"Sentiment filter error: {e} — allowing trade")
+            logger.warning(f"Sentiment filter error: {e} — allowing")
             return True, "Sentiment check skipped (error)"
 
-    def _check_btc_regime(self, btc_regime: BTCRegimeResult, direction: Optional[str]) -> Tuple[bool, str]:
+    def _check_btc_regime(
+        self,
+        btc_regime: BTCRegimeResult,
+        direction: Optional[str]
+    ) -> Tuple[bool, str]:
         if not btc_regime:
             return False, "BTC regime data not available"
         if not btc_regime.can_trade:
@@ -162,38 +249,30 @@ class Tier1Filters:
         return True, f"Volume: {ratio:.1f}x average"
 
     def _check_liquidity(self, data: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        ISSUE 5 FIX:
-        - All bid/ask values cast to float explicitly
-        - "No orderbook data" → FAIL (was: allow) for production safety
-          EXCEPT when we genuinely have no data at all (paper/dev mode)
-        """
+        """ISSUE 5 FIX: explicit float() conversion on all orderbook entries"""
         orderbook = data.get("orderbook", {})
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
 
-        # No orderbook — in paper/dev allow; in production this should be populated
         if not bids or not asks:
-            if config.ENV == "production":
-                return False, "No orderbook data — rejecting in production"
-            return True, "No orderbook data — allowing (non-production)"
+            if getattr(config, "ENV", "development") == "production":
+                return False, "No orderbook — rejecting in production"
+            return True, "No orderbook — allowing (non-production)"
 
-        # ISSUE 5 FIX: explicit float conversion with error handling
         try:
             best_bid = float(bids[0][0])
             best_ask = float(asks[0][0])
         except (TypeError, ValueError, IndexError) as e:
-            logger.warning(f"Orderbook float conversion failed: {e}")
+            logger.warning(f"Orderbook parse error: {e}")
             return True, "Invalid orderbook format — allowing"
 
         if best_bid <= 0 or best_ask <= 0:
-            return True, "Zero orderbook prices — allowing"
+            return True, "Zero prices — allowing"
 
-        spread_pct = ((best_ask - best_bid) / best_bid) * 100
+        spread_pct = (best_ask - best_bid) / best_bid * 100
         if spread_pct > 0.1:
             return False, f"Spread too wide: {spread_pct:.3f}%"
 
-        # ISSUE 5 FIX: float() on all depth entries
         try:
             bid_depth = sum(float(b[1]) for b in bids[:5] if len(b) > 1)
             ask_depth = sum(float(a[1]) for a in asks[:5] if len(a) > 1)
@@ -203,11 +282,11 @@ class Tier1Filters:
         if bid_depth < 10_000 or ask_depth < 10_000:
             return False, f"Thin orderbook: Bid ${bid_depth:,.0f} Ask ${ask_depth:,.0f}"
 
-        return True, f"Spread {spread_pct:.3f}%, Depth ${bid_depth+ask_depth:,.0f}"
+        return True, f"Spread {spread_pct:.3f}%, Depth ${bid_depth + ask_depth:,.0f}"
 
     def _check_session(self) -> Tuple[bool, str]:
         import pytz
-        now = datetime.now(pytz.timezone("Asia/Kolkata"))
+        now  = datetime.now(pytz.timezone("Asia/Kolkata"))
         hour = now.hour
 
         for start, end, name in config.AVOID_TIMES:
