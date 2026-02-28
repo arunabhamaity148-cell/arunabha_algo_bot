@@ -22,6 +22,7 @@ from analysis.volume_profile import VolumeProfileAnalyzer
 from analysis.sentiment import SentimentAnalyzer, MarketMood
 from analysis.anchored_vwap import AnchoredVWAPAnalyzer
 from analysis.orderflow import OrderflowAnalyzer
+from analysis.amd import AMDDetector
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class Tier2Filters:
         self.sentiment_analyzer = SentimentAnalyzer()
         self.avwap     = AnchoredVWAPAnalyzer()
         self.orderflow = OrderflowAnalyzer()
+        self.amd       = AMDDetector()
         self.weights   = config.TIER2_FILTERS
 
     def evaluate_all(
@@ -65,11 +67,12 @@ class Tier2Filters:
         add("rsi_divergence",      self._check_rsi_divergence,         data, direction)
         add("ema_stack",           self._check_ema_stack,              data, direction)
         add("atr_percent",         self._check_atr_percent,            data)
-        add("anchored_vwap",       self._check_anchored_vwap,          data, direction)  # ← REPLACES vwap_position
+        add("anchored_vwap",       self._check_anchored_vwap,          data, direction)
         add("support_resistance",  self._check_support_resistance,     data, direction)
         add("volume_on_structure", self._check_volume_on_structure,    data, direction)
         add("sentiment",           self._check_sentiment_score,        data, direction)
-        add("orderflow_cvd",       self._check_orderflow_cvd,          data, direction)  # ← NEW
+        add("orderflow_cvd",       self._check_orderflow_cvd,          data, direction)
+        add("amd_phase",           self._check_amd_score,              data, direction)  # ← NEW v7.0
 
         percentage = (total_score / max_score * 100) if max_score > 0 else 0
         threshold  = self._get_threshold(market_type)
@@ -413,3 +416,100 @@ class Tier2Filters:
             nr = min(resistances); dist = (nr-price)/price*100
             return True, (5 if dist < 1.0 else 3), f"Resistance {nr:.4f} ({dist:.2f}% away)"
         return False, 1, "No nearby S/R"
+
+    # ──────────────────────────────────────────────────────────────────
+    # NEW v7.0: AMD Phase Score
+    # ──────────────────────────────────────────────────────────────────
+
+    def _check_amd_score(
+        self, data: Dict, direction: Optional[str]
+    ) -> Tuple[bool, int, str]:
+        """
+        AMD phase scoring for Tier2.
+
+        Post-manipulation + direction match → highest score (15)
+        Distribution active + direction match → good score (10-12)
+        Manipulation detected → moderate (8)
+        Unknown/no signal → neutral (5)
+        Accumulation (shouldn't reach here, blocked in Tier1) → 0
+        Session AMD valid adds +2 bonus
+
+        Max: 15 points
+        """
+        ohlcv = data.get("ohlcv", {}).get("15m", [])
+        if len(ohlcv) < 30:
+            return True, 5, "Insufficient data — AMD neutral"
+
+        try:
+            from datetime import datetime
+            import pytz
+            now      = datetime.now(pytz.timezone("Asia/Kolkata"))
+            hour_ist = now.hour
+        except Exception:
+            hour_ist = None
+
+        try:
+            result = self.amd.analyze(ohlcv, direction=direction, session_hour_ist=hour_ist)
+            score  = 0
+            msg    = ""
+
+            # Accumulation = bad (Tier1 should have blocked, but score 0 here too)
+            if result.phase == "ACCUMULATION":
+                return False, 0, f"AMD: Accumulation phase — no edge"
+
+            # Post-manipulation = best setup
+            if result.post_manipulation:
+                dir_match = (
+                    (direction == "LONG"  and result.manipulation_direction == "BEAR_SWEEP") or
+                    (direction == "SHORT" and result.manipulation_direction == "BULL_SWEEP") or
+                    direction is None
+                )
+                score = 15 if dir_match else 6
+                msg   = (
+                    f"Post-manipulation {result.manipulation_direction} "
+                    f"({'direction match' if dir_match else 'direction mismatch'})"
+                )
+
+            # Distribution active
+            elif result.distribution_active:
+                dir_match = (
+                    direction is None or
+                    result.distribution_direction == direction
+                )
+                if result.distribution_strength == "STRONG" and dir_match:
+                    score = 12
+                elif dir_match:
+                    score = 10
+                else:
+                    score = 4
+                msg = (
+                    f"Distribution {result.distribution_direction} "
+                    f"({result.distribution_strength}, vol {result.momentum_ratio:.1f}x)"
+                )
+
+            # Manipulation in progress
+            elif result.manipulation_detected:
+                score = 8
+                msg   = f"Manipulation detected ({result.manipulation_direction})"
+
+            # AMD score from signal
+            else:
+                score = min(result.amd_score, 7)
+                msg   = f"AMD phase={result.phase} score={result.amd_score}/10"
+
+            # Session bonus
+            if result.session_amd_valid:
+                score = min(15, score + 2)
+                msg  += f" | Session={result.session_phase} ✓"
+
+            # FVG near price adds confidence
+            if result.nearest_fvg and not result.nearest_fvg.filled:
+                fvg = result.nearest_fvg
+                msg += f" | FVG {fvg.direction} {fvg.gap_pct:.2f}%"
+                score = min(15, score + 1)
+
+            return score >= 5, score, msg
+
+        except Exception as e:
+            logger.warning(f"AMD score error: {e}")
+            return True, 5, f"AMD error — neutral (5)"
