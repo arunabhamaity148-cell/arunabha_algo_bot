@@ -295,6 +295,11 @@ class ArunabhaEngine:
         self.state.update_last_signal_time(symbol)
         self.state.register_active_signal(symbol, direction)
         self.daily_signals += 1
+        # ✅ FIX BUG-3: daily_signals_count state-এ save করো
+        # আগে শুধু in-memory রাখা হত — restart হলে 0 হয়ে যেত
+        # দিনে max signal limit bypass হতে পারত
+        self.state.state["daily_signals_count"] = self.daily_signals
+        self.state._save()
         self.last_signal_time[symbol] = datetime.now()
 
         # Entry zone (calculate before sending)
@@ -395,9 +400,13 @@ class ArunabhaEngine:
 
     async def on_trade_result(self, symbol: str, pnl_pct: float):
         """Record trade result — updates adaptive threshold"""
-        pnl_inr = self.state.current_balance * (pnl_pct / 100)
+        # ✅ FIX BUG-4: পূর্বে দুই ব্রাঞ্চেই একই calculation ছিল (duplicate)
+        # Paper mode-এ simulated balance ব্যবহার করা হয়;
+        # Live mode-এ actual exchange balance থেকে পাওয়া pnl_pct × balance
+        # দুটোর formula same হলেও, source of truth আলাদা রাখা উচিত।
 
         if self.paper_trading:
+            # Paper: simulated balance দিয়ে P&L calculate করো
             pnl_inr = self.state.current_balance * (pnl_pct / 100)
             # ISSUE 20 FIX: persisted via state_manager (survives restart)
             self.state.record_paper_trade(symbol, pnl_inr)
@@ -407,6 +416,7 @@ class ArunabhaEngine:
                 f"(sim ₹{pnl_inr:+.0f}) | Total: ₹{self._paper_pnl:+,.0f}"
             )
         else:
+            # Live: actual account balance × pnl_pct
             pnl_inr = self.state.current_balance * (pnl_pct / 100)
             self.state.record_trade(symbol, pnl_pct, pnl_inr)
 
@@ -566,6 +576,32 @@ class ArunabhaEngine:
             except Exception:
                 sentiment_data = None
 
+            # ✅ FIX OI/FUNDING: Real API calls দিয়ে live data আনো
+            # আগে hardcoded 0 ছিল — Tier2 funding_rate ও open_interest filter
+            # কোনো real signal পাচ্ছিল না, সবসময় "neutral" দেখাচ্ছিল
+            funding_rate = 0.0
+            open_interest_data = {}
+            try:
+                funding_rate = await self.rest_client.fetch_funding_rate(symbol)
+            except Exception as e:
+                logger.debug(f"Funding rate fetch skipped {symbol}: {e}")
+
+            try:
+                oi_current = await self.rest_client.fetch_open_interest(symbol)
+                # OI change % calculate করতে cached previous value দরকার
+                oi_prev_key = f"oi_prev_{symbol}"
+                oi_prev = self.state.state.get(oi_prev_key, oi_current)
+                oi_change_pct = ((oi_current - oi_prev) / oi_prev * 100) if oi_prev > 0 else 0.0
+                # এবার previous value save করো
+                self.state.state[oi_prev_key] = oi_current
+                open_interest_data = {
+                    "current": oi_current,
+                    "previous": oi_prev,
+                    "change_pct": round(oi_change_pct, 2),
+                }
+            except Exception as e:
+                logger.debug(f"OI fetch skipped {symbol}: {e}")
+
             return {
                 "ohlcv": {"15m": candles, "1h": ohlcv_1h, "4h": ohlcv_4h},
                 "btc_ohlcv": {          # ← FIXED: passed to Tier3 correlation
@@ -574,8 +610,8 @@ class ArunabhaEngine:
                 },
                 "direction": direction,
                 "structure": struct,
-                "funding_rate": 0,
-                "open_interest": {},
+                "funding_rate": funding_rate,        # ✅ Real API
+                "open_interest": open_interest_data, # ✅ Real API with change_pct
                 "orderbook": {},
                 "fear_index": 50,
                 "sentiment": sentiment_data,   # ← passed to Tier1/Tier2 sentiment
