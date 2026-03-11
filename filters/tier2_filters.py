@@ -44,7 +44,8 @@ class Tier2Filters:
         symbol: str,
         direction: Optional[str],
         market_type: MarketType,
-        data: Dict[str, Any]
+        data: Dict[str, Any],
+        threshold_override: Optional[float] = None,   # ✅ FIX BUG-7: adaptive threshold
     ) -> Tuple[bool, float, Dict[str, Any]]:
 
         results = {}
@@ -75,8 +76,17 @@ class Tier2Filters:
         add("amd_phase",           self._check_amd_score,              data, direction)  # ← NEW v7.0
 
         percentage = (total_score / max_score * 100) if max_score > 0 else 0
-        threshold  = self._get_threshold(market_type)
-        passed     = percentage >= threshold
+
+        # ✅ FIX BUG-7: threshold_override (adaptive) actually ব্যবহার করো
+        # আগে engine থেকে tier2_threshold_override pass হত filter_orchestrator-এ
+        # কিন্তু tier2.evaluate_all() সেটা নিত না — সবসময় _get_threshold() ডাকত
+        # এখন: threshold_override থাকলে সেটাই ব্যবহার হবে, না থাকলে market_type default
+        if threshold_override is not None:
+            threshold = float(threshold_override)
+        else:
+            threshold = self._get_threshold(market_type)
+
+        passed = percentage >= threshold
 
         return passed, percentage, results
 
