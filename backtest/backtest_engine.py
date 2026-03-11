@@ -31,6 +31,31 @@ TARGETS:
   Win Rate: 45%+ (আগে 28%)
   Profit Factor: 1.3+ (আগে 0.53)
   Max Drawdown: <20% (আগে 52%)
+
+⚠️  FIX BUG-2: BACKTEST vs LIVE SIGNAL LOGIC MISMATCH
+===========================================================
+এই backtest engine একটি SIMPLIFIED simulation।
+
+Live bot signal chain:
+  Tier1 (8 mandatory filters) → Tier2 (13 scored filters, adaptive threshold)
+  → Tier3 (6 bonus filters) → Signal Generator
+
+Backtest signal chain (এখানে):
+  Gate 1: EMA50 regime filter
+  Gate 2: BOS/CHoCH + volume confirmation
+  Gate 3: RSI momentum check
+  Gate 4: RR validation (min 2.0)
+
+কারণ backtest-এ full 3-tier live system চালানো সম্ভব নয়:
+  - Tier1-এ session VWAP, sentiment, AMD phase real-time data দরকার
+  - Tier2-এ funding rate, OI, orderflow CVD live API দরকার
+  - Tier3-এ whale movement, news sentiment real-time দরকার
+
+তাই backtest result সবসময় live performance-এর upper bound।
+Live-এ আরো বেশি signal block হবে (Tier2 25+ check আছে)।
+
+DISCLAIMER: Walk-forward "ROBUST" verdict মানে simplified gates-এ robust।
+  Live performance আলাদা হবে। সবসময় paper trade করো আগে।
 """
 
 import logging
@@ -149,9 +174,16 @@ class BacktestEngine:
                         self.peak_capital = self.capital
                     last_signal_idx = i
 
-                    # Daily max loss guard: stop if -3% today
-                    if (self.capital / self.initial_capital - 1) * 100 < -30:
-                        logger.warning("Equity -30% — stopping backtest")
+                    # ✅ FIX ISSUE-9: Drawdown guard ঠিক করা হয়েছে
+                    # আগে: -30% threshold — অনেক বেশি, কোনো কাজে আসে না
+                    # Comments-এ "-3% today" লেখা ছিল কিন্তু code-এ -30% ছিল!
+                    # এখন: overall equity -50% → catastrophic stop (total ruin prevention)
+                    current_return_pct = (self.capital / self.initial_capital - 1) * 100
+                    if current_return_pct < -50:
+                        logger.warning(
+                            f"🛑 Equity {current_return_pct:.1f}% — "
+                            f"catastrophic loss (₹{self.capital:,.0f}), stopping backtest"
+                        )
                         break
 
             equity_curve.append(self.capital)
@@ -587,6 +619,12 @@ class BacktestEngine:
         else:
             verdict = "NO EDGE — Real money দিও না"
         print(f"\n  VERDICT: {verdict}")
+
+        # ✅ FIX BUG-2: Backtest simplified simulation disclaimer
+        print("\n  ⚠️  IMPORTANT — BACKTEST vs LIVE MISMATCH:")
+        print("  এই backtest 4-gate simplified filter ব্যবহার করে।")
+        print("  Live bot-এ Tier1(8) + Tier2(13) + Tier3(6) = 25+ checks আছে।")
+        print("  Live-এ আরো বেশি signal block হবে। Paper trade আগে করো।")
         print("═" * 65)
 
 
