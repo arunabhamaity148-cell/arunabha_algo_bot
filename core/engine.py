@@ -176,9 +176,23 @@ class ArunabhaEngine:
         logger.info("✅ Engine stopped")
 
     async def _on_candle_close(self, symbol: str, tf: str, candles: List[List[float]]):
-        """Called on every closed candle"""
+        """Called on every closed candle from WebSocket feed.
+
+        ✅ FIX BUG-B: Dual cache sync
+        WebSocket feed এর নিজস্ব feed._cache আছে।
+        Engine এর আলাদা CacheManager (self.cache) আছে।
+        আগে এই দুটো কখনো sync হতো না।
+        _build_data_packet() self.cache পড়ে — তাই সবসময় stale seed data পেত।
+
+        Fix: প্রতিটি closed candle-এ self.cache.set_ohlcv() call করো।
+        এতে WS live data সরাসরি CacheManager-এ চলে যাবে।
+        """
         if tf != "15m":
             return
+
+        # ✅ FIX BUG-B: WS candle → CacheManager sync
+        # Live candle data এখন analysis pipeline-এ পৌঁছাবে
+        self.cache.set_ohlcv(symbol, tf, candles)
 
         # Update BTC cache
         if symbol == "BTC/USDT":
