@@ -2,9 +2,20 @@
 ARUNABHA ALGO BOT - Trading Scheduler v5.0
 
 FIXES:
-- BUG-1:  BTC 1h/4h cache stale — _periodic_htf_refresh() added (প্রতি ঘণ্টা REST refresh)
-- BUG-21: timezone naive/aware comparison fixed
-- BUG-22: NY session 18:00 → 17:00 IST (tier1_filters.py এর সাথে align)
+- BUG-A:  _force_scan এ engine._generate_signal() call ছিল — method exist করে না!
+          Fix: engine._analyze_symbol() তে rename করা হয়েছে (AttributeError runtime crash fix)
+- BUG-21: timezone localize error fixed
+  আগে: datetime.combine() naive datetime তৈরি করত, তারপর localize() crash করত
+  কারণ: now = datetime.now(self.timezone) → aware datetime
+        target = datetime.combine(now.date(), target_time) → naive datetime
+        self.timezone.localize(target) → pytz এ এটা ঠিক আছে কিন্তু
+        (target - now) করলে aware vs naive comparison error হতো
+  Fix: সব datetime consistently aware রাখা হয়েছে
+
+- BUG-22: NY session scheduler 18:00 তে fire করে
+  কিন্তু tier1_filters.py তে 17:00 থেকে NY session active দেখায়
+  Fix: scheduler এ 17:00 তে NY session start করা হয়েছে (17-22 IST)
+       constants.py ও align করা হয়েছে
 """
 
 import asyncio
@@ -123,7 +134,7 @@ class TradingScheduler:
                         candles = self.engine.cache.get_ohlcv(symbol, "15m")
                         if candles and len(candles) > 20:
                             logger.info(f"🔍 Scanning {symbol} ({len(candles)} candles)")
-                            await self.engine._generate_signal(symbol, candles)
+                            await self.engine._analyze_symbol(symbol, candles)
                         else:
                             logger.warning(f"⚠️ {symbol}: {len(candles) if candles else 0} candles (need 20+)")
                     except Exception as e:
@@ -144,7 +155,7 @@ class TradingScheduler:
         ✅ FIX BUG-21: timezone comparison ঠিক করা হয়েছে
         আগে: datetime.combine() naive datetime দিত → localize() তে crash বা
               aware vs naive comparison error হতো
-        এখন: সব datetime aware রাখা হয়েছে
+        এখন: সব datetime aware রাখা হয়েছে, astimezone() ব্যবহার করা হচ্ছে
         """
         target_time_str = task_config["time"]
         target_hour, target_minute = map(int, target_time_str.split(":"))
@@ -218,7 +229,7 @@ class TradingScheduler:
         Fix: প্রতি ঘণ্টায় engine._force_fetch_btc_data() call করো,
              তারপর _update_regime() দিয়ে regime তাৎক্ষণিক refresh করো।
         """
-        # প্রথম run-এ 1 ঘণ্টা পর শুরু (bot-start এ data fresh আছে)
+        # প্রথম run-এ 1 ঘণ্টা পর শুরু (bot-start এই data fresh আছে)
         await asyncio.sleep(self._htf_refresh_interval)
 
         while self.running:
