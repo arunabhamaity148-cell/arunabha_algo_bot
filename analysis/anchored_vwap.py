@@ -151,6 +151,14 @@ class AnchoredVWAPAnalyzer:
 
     # ── Session boundary detection ────────────────────────────────────
 
+    def get_session_candle_count(self, ohlcv: List[List[float]]) -> int:
+        """
+        ✅ FIX BUG-6: Public API for session candle count.
+        আগে Tier1Filter থেকে private _get_session_candles() access করা হচ্ছিল।
+        এখন public method expose করা হয়েছে — proper OOP design।
+        """
+        return len(self._get_session_candles(ohlcv))
+
     def _get_session_candles(self, ohlcv: List[List[float]]) -> List[List[float]]:
         """
         Return candles from today's session start.
