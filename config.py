@@ -1,11 +1,17 @@
 """
-ARUNABHA ALGO BOT v4.1 - Master Configuration (FIXED)
+ARUNABHA ALGO BOT v5.0 - Master Configuration
 
 FIXES:
 - validate_all() এখন import এর সময় চলে না
 - Dead zone midnight bug fix (23-1 → 23-24 + 0-1)
 - GST calculation ঠিক করা হয়েছে
 - Fear & Greed low-end block (< 15) যোগ করা হয়েছে
+
+VERSION HISTORY:
+- v4.1: Original config
+- v5.0: Unified version tag (README, config, engine সব v5.0)
+        SESSION_SIZE_MULTIPLIERS added (from engine.py hardcoded)
+        TIER2_FILTERS: amd_phase added (scoring from v7 logic, tag unified)
 """
 
 import os
