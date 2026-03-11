@@ -88,14 +88,15 @@ class FilterOrchestrator:
 
         # ── TIER 2 ───────────────────────────────────────────────
         tier2_passed, tier2_score, tier2_results = self.tier2.evaluate_all(
-            symbol, direction, market_type, data
+            symbol, direction, market_type, data,
+            threshold_override=tier2_threshold_override   # ✅ FIX BUG-7: pass adaptive threshold
         )
         result["tier2"] = tier2_results
         result["score"] = tier2_score
 
         logger.info(f"   T2 score: {tier2_score:.1f}% (need {tier2_min:.0f}%)")
 
-        # Use adaptive threshold
+        # Use adaptive threshold (already applied inside tier2.evaluate_all now)
         tier2_ok = tier2_score >= tier2_min
         if not tier2_ok:
             result["reason"] = (
