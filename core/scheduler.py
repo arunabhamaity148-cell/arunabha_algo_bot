@@ -1,19 +1,10 @@
 """
-ARUNABHA ALGO BOT - Trading Scheduler v4.1
+ARUNABHA ALGO BOT - Trading Scheduler v5.0
 
 FIXES:
-- BUG-21: timezone localize error fixed
-  আগে: datetime.combine() naive datetime তৈরি করত, তারপর localize() crash করত
-  কারণ: now = datetime.now(self.timezone) → aware datetime
-        target = datetime.combine(now.date(), target_time) → naive datetime
-        self.timezone.localize(target) → pytz এ এটা ঠিক আছে কিন্তু
-        (target - now) করলে aware vs naive comparison error হতো
-  Fix: সব datetime consistently aware রাখা হয়েছে
-
-- BUG-22: NY session scheduler 18:00 তে fire করে
-  কিন্তু tier1_filters.py তে 17:00 থেকে NY session active দেখায়
-  Fix: scheduler এ 17:00 তে NY session start করা হয়েছে (17-22 IST)
-       constants.py ও align করা হয়েছে
+- BUG-1:  BTC 1h/4h cache stale — _periodic_htf_refresh() added (প্রতি ঘণ্টা REST refresh)
+- BUG-21: timezone naive/aware comparison fixed
+- BUG-22: NY session 18:00 → 17:00 IST (tier1_filters.py এর সাথে align)
 """
 
 import asyncio
@@ -60,6 +51,10 @@ class TradingScheduler:
              "session": SessionType.OVERLAP},
         ]
 
+        # ✅ FIX BUG-1: HTF refresh interval (seconds)
+        # WebSocket শুধু 15m candle দেয়। 1h/4h এর জন্য periodic REST fetch দরকার।
+        self._htf_refresh_interval = 3600  # 1 ঘণ্টা
+
     async def start(self):
         """Start the scheduler"""
         self.running = True
@@ -67,6 +62,10 @@ class TradingScheduler:
 
         self.tasks.append(asyncio.create_task(self._main_loop()))
         self.tasks.append(asyncio.create_task(self._force_scan()))
+
+        # ✅ FIX BUG-1: BTC 1h/4h stale cache fix
+        # WebSocket শুধু 15m feed করে। 1h/4h প্রতি ঘণ্টায় REST দিয়ে refresh করতে হবে।
+        self.tasks.append(asyncio.create_task(self._periodic_htf_refresh()))
 
         for task_config in self.scheduled_tasks:
             self.tasks.append(asyncio.create_task(
@@ -145,7 +144,7 @@ class TradingScheduler:
         ✅ FIX BUG-21: timezone comparison ঠিক করা হয়েছে
         আগে: datetime.combine() naive datetime দিত → localize() তে crash বা
               aware vs naive comparison error হতো
-        এখন: সব datetime aware রাখা হয়েছে, astimezone() ব্যবহার করা হচ্ছে
+        এখন: সব datetime aware রাখা হয়েছে
         """
         target_time_str = task_config["time"]
         target_hour, target_minute = map(int, target_time_str.split(":"))
@@ -204,6 +203,40 @@ class TradingScheduler:
             if start <= hour < end:
                 return session
         return None
+
+    # ✅ FIX BUG-1: Periodic HTF (1h/4h) BTC cache refresh
+    async def _periodic_htf_refresh(self):
+        """
+        প্রতি 1 ঘণ্টায় BTC 1h ও 4h candle REST দিয়ে refresh করো।
+
+        কেন দরকার:
+          WebSocket শুধু 15m candle feed করে।
+          Bot start-এ _force_fetch_btc_data() 1h/4h আনে —
+          কিন্তু এরপর আর কখনো update হয় না।
+          _update_regime() তখন stale data দিয়ে regime detect করে।
+
+        Fix: প্রতি ঘণ্টায় engine._force_fetch_btc_data() call করো,
+             তারপর _update_regime() দিয়ে regime তাৎক্ষণিক refresh করো।
+        """
+        # প্রথম run-এ 1 ঘণ্টা পর শুরু (bot-start এ data fresh আছে)
+        await asyncio.sleep(self._htf_refresh_interval)
+
+        while self.running:
+            try:
+                logger.info("🔄 HTF refresh: fetching BTC 1h/4h via REST...")
+                ok = await self.engine._force_fetch_btc_data()
+                if ok:
+                    logger.info("✅ BTC 1h/4h cache refreshed successfully")
+                    await self.engine._update_regime()
+                    logger.info("✅ Regime updated with fresh HTF data")
+                else:
+                    logger.warning("⚠️ HTF refresh failed — will retry next cycle")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ HTF refresh error: {e}")
+
+            await asyncio.sleep(self._htf_refresh_interval)
 
     async def _daily_reset(self):
         """Reset daily counters at midnight IST"""
@@ -310,4 +343,3 @@ class TradingScheduler:
             "end_ist": f"{first['end']:02d}:00",
             "hours_away": (24 - current_hour) + first["start"]
         }
-        
