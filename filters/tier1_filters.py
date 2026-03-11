@@ -124,7 +124,10 @@ class Tier1Filters:
             dev = avwap_result.deviation_pct.get("session", 0.0)
 
             # Session-এ candle কম → VWAP reliable না, skip করো
-            session_candles_count = len(self.avwap._get_session_candles(ohlcv))
+            # ✅ FIX BUG-6: private method এর বদলে public API ব্যবহার করো
+            # আগে: self.avwap._get_session_candles(ohlcv) → OOP violation
+            # এখন: self.avwap.get_session_candle_count(ohlcv) → proper interface
+            session_candles_count = self.avwap.get_session_candle_count(ohlcv)
             if session_candles_count < SESSION_VWAP_MIN_CANDLES:
                 return True, f"Session too new ({session_candles_count} candles) — VWAP skip"
 
